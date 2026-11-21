@@ -181,3 +181,16 @@ Equivalence evidence: scripts/diff_swap.py over EVERY single-op is/==/is not/!= 
 Unit test: build-time index == lazy == corrupt-index output on every edge-case patch.
 gate.py fix: the base revision now also gets its eqsites.json (before, gating against v8 ran v8 without
 its swap rule and overstated the base cost).
+
+### experiment/value-trace-v12 (01f0536ee0e318116a588206c46bd0f8dfbd511b, base 8991e94)
+
+- Rule: single-constant comparison constant changes -> tests whose traced operand values flip the result (see commit).
+  697 eligible source sites, 677 executed; 0 of 266 existing patches (sample + older corpora) are of this kind.
+- New independent corpus ../stress_cv (32: 8 int-threshold, 8 int-equality, 8 str-equality, 4 import-seen and
+  4 unknown-operand controls), full-suite truth: 0 missed. Cost 810.5 -> 456.5 s (−354.1 s, −43.7 %); 20 improved,
+  0 slower, 12 unchanged (incl. all unknown controls).
+- Gate vs 8991e94, sample + 17 corpora: PASS, 0/30, 0/219 truth mutants, unit tests OK, fill 0.0 s, narrowed verified;
+  sample 101.6 -> 101.6 s; older mutants unchanged.
+- CPU (bench, 3 runs): sample 0.388 -> 0.396 s; 141 older mutants 3.263 -> 3.265 s; cv corpus 2.110 -> 1.280 s.
+- Docker (no-cache amd64, git archive 01f0536): make sample 101.552 s, 0 misses; image output byte-identical to local on
+  all 32 cv mutants.
