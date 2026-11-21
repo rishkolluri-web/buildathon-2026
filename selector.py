@@ -1033,14 +1033,21 @@ class Selector:
         # class users, which the header-change rules already select. Only statements
         # inside bodies that actually ran at import count as import-time changes.
         imp_lines = self.m.imp.get(path, set()) if "imp" not in OFF else set()
-        if imp_lines and "hdrimp" not in OFF:
-            headers = set()
-            for node in ast.walk(old_tree):
-                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-                    headers |= header_lines(node)
-                    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and is_stub(node):
-                        headers |= span(node)  # `def f(...): ...` stubs: body does nothing
-            imp_lines = imp_lines - headers
+        headers = None  # header lines of the whole file: only needed once a region hits imp_lines
+
+        def import_time(lines):
+            nonlocal headers
+            hit = lines & imp_lines
+            if not hit or "hdrimp" in OFF:
+                return hit
+            if headers is None:
+                headers = set()
+                for node in ast.walk(old_tree):
+                    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                        headers |= header_lines(node)
+                        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and is_stub(node):
+                            headers |= span(node)  # `def f(...): ...` stubs: body does nothing
+            return hit - headers
         d = Differ(old_lines, new_lines, old_touched, new_touched)
         d.body(old_tree.body, new_tree.body, ("module", None), None)
         out = set()
@@ -1053,10 +1060,11 @@ class Selector:
             self.related |= self.family_users(path)
         for r in d.regions:
             if r[0] == "lines":
-                if not is_test_file and r[1] & imp_lines:
+                hit = import_time(r[1]) if not is_test_file else None
+                if hit:
                     # runs while sqlglot is imported (metaclass, __init_subclass__,
                     # factories used in class bodies): every test inherits its effect
-                    log(f"  {path}: import-time line(s) {sorted(r[1] & imp_lines)[:5]} -> all tests")
+                    log(f"  {path}: import-time line(s) {sorted(hit)[:5]} -> all tests")
                     return ALL
                 out |= self.m.nums(self.lines_bits(path, r[1]))
             elif r[0] == "lambda":
