@@ -137,3 +137,14 @@ One rule vs aa103eb: cross-dialect propagation is attribute-level. A reference t
 - Gate, sample + 7 corpora (stress, h3, x, u, v, c, w; 56 truth mutants): vs c003640 PASS (total 1437.5 -> 1301.7, -135.8 s); vs aa103eb PASS (1383.7 -> 1301.7, -82.0 s); 0/30 sample, 0/56 mutants, fill 0.0 s, all narrowed patches verified. Unit tests OK.
 - Docker (exact 8238fd6, no-cache amd64, make sample): 170.349 s, 0 misses, run 2.3 s, protocol OK.
 - Recommended next submission: 8238fd6 (pending team review). c003640 stays the final pick unless this beats 190.8 s officially.
+
+### Official BB-CD8DBEBB (8238fd6, experiment/attrdeps-v7): **181.1 s, 0 misses — NEW BEST, entered in the final**
+
+| Submission | SHA | Score | Simulated | CPU | Missed |
+|---|---|---|---|---|---|
+| **BB-CD8DBEBB** | 8238fd692c02fc764e953ae4a15706a64e6c01d8 | **181.1 s** | 179.522 s (3 identical runs) | 1.53-1.56 s | 0 |
+| BB-977554CD | aa103ebfcbbfd2c407640ddbb37bc90f5a3265ce | 196.7 s | 195.335 s | 1.34 s | 0 |
+| BB-709BA77F | 107a4c369c20be07204f3ab85719d92807f57640 | 222.0 s | 220.777 s | ~1.2 s | 0 |
+| BB-7C706349 (previous best) | c00364018665e0abfad31a10173d9044892e7c69 | 190.8 s | 189.804 s | ~1.0 s | 0 |
+
+Attribute-level cross-dialect tracking recovered 15.8 s simulated vs aa103eb (195.335 -> 179.522) and beats c003640 by 10.3 s simulated while fixing its confirmed gaps (new dialect modules; Teradata/MySQL time mappings). CPU +0.2 s vs aa103eb (source scans; could move to build time).
