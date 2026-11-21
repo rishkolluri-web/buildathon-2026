@@ -32,7 +32,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--src", required=True)
     ap.add_argument("--out", required=True)
-    ap.add_argument("--set", default="t", choices=["t", "u"], help="t: first targeted set; u: follow-up set")
+    ap.add_argument("--set", default="t", choices=["t", "u", "v"], help="t: first targeted set; u: follow-up set; v: scoped-class-data/new-dialect audit")
     a = ap.parse_args()
     src, out = Path(a.src), Path(a.out)
     (out / "commits").mkdir(parents=True, exist_ok=True)
@@ -89,6 +89,24 @@ def main():
             "u7-lazy-attr": [edit("sqlglot/optimizer/__init__.py",
                                   '"traverse_scope": ("sqlglot.optimizer.scope", "traverse_scope"),',
                                   '"traverse_scope": ("sqlglot.optimizer.scope", "walk_in_scope"),')],
+        }
+    elif a.set == "v":
+        dia = "from sqlglot.dialects.dialect import Dialect\n\n\nclass {}(Dialect):\n    NORMALIZE_FUNCTIONS = False\n"
+        muts = {
+            # class-object read dialect.parser_class.LOG_DEFAULTS_TO_LN (parser.py:107): most
+            # executing tests are outside the scoped selection for these classes
+            "v1-dremio-logln": [edit("sqlglot/parsers/dremio.py", "    LOG_DEFAULTS_TO_LN = True\n", "    LOG_DEFAULTS_TO_LN = False\n")],
+            "v2-drill-logln": [edit("sqlglot/parsers/drill.py", "    LOG_DEFAULTS_TO_LN = True\n", "    LOG_DEFAULTS_TO_LN = False\n")],
+            # generic generator flag (Person 1's f21/f11 risk class; not their exact patches)
+            "v3-teradata-tablehints": [edit("sqlglot/generators/teradata.py", "    TABLE_HINTS = False\n", "    TABLE_HINTS = True\n")],
+            "v4-drill-tablehints": [edit("sqlglot/generators/drill.py", "    TABLE_HINTS = False\n", "    TABLE_HINTS = True\n")],
+            # generic dialect-level setting
+            "v5-drill-nullordering": [edit("sqlglot/dialects/drill.py", '    NULL_ORDERING = "nulls_are_last"\n', '    NULL_ORDERING = "nulls_are_large"\n')],
+            # generic expression flag read by hashing code
+            "v6-hash-raw-args": [edit("sqlglot/expressions/query.py", "    _hash_raw_args = True\n", "    _hash_raw_args = False\n")],
+            # new dialect modules: second probed unknown name, and a name a test defines itself
+            "v7-newdialect-unknownname": [("sqlglot/dialects/asdfjasodiufjsd.py", None, dia.format("Asdfjasodiufjsd"))],
+            "v8-newdialect-testdefined": [("sqlglot/dialects/mydialect.py", None, dia.format("Mydialect"))],
         }
     else:
         muts = {k: [v] for k, v in muts.items()}

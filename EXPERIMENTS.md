@@ -96,3 +96,10 @@ Fixes (this commit): class data -> readers ∩ (class users ∪ dialect family �
 Truth added: u6 0, u7 1, m050 0, m066 0, m068 463 (incl. COLLECT test_mysql.py) failing; all selected.
 Gate vs c003640 (stress + stress_h3 + stress_x + stress_u): PASS, 0/30 sample, 0/38 mutants, total 1269.3 -> 1148.0 s (-121.3 s), fill 0.0 s, unit tests 42 OK (1 skipped). Docker (exact snapshot da383f7, no-cache amd64, make sample): 170.349 s, 0 misses, protocol OK. CPU sample 0.244 (c003640) / 0.237 (107a4c3) / 0.249 s; 91 mutations 1.43 / 1.61 / 1.63 s.
 c003640 known gap: a new sqlglot/dialects/<name>.py (u1) breaks test_get_or_raise; c003640 selects 0 tests.
+
+### Audit of b2c241e (in progress)
+
+- Docker snapshot da383f7 vs b2c241e: selector.py, map.json.gz, Dockerfile, docker/fetch_sqlglot.py byte-identical (same blob ids); only EXPERIMENTS.md differs -> Docker 170.349 s / 0 misses applies to b2c241e.
+- Re-checked truth (b2c241e, 0 missed): t3 39 sel/2 failing, t5 57/2, t6 5/0, x_t11_035 12/2, u1 95/1 (#193; c003640 misses it), u4 43/4, u5 26/2, u7 all/1.
+- Class-object read audit: the only such reads in sqlglot/tests are `*_class.NAME`; with readers applicable, only parser.py:107 `dialect.parser_class.LOG_DEFAULTS_TO_LN` has executing tests outside the scope (e.g. 5/6 for DremioParser). Argued safe (read on the dialect in use -> its family users), but verified only by truth below.
+- Person 1's f11/f21 TABLE_HINTS patches are not in any branch or local corpus; own risk-class mutants instead (../stress_v, `targeted_mutations.py --set v`): v1/v2 Dremio/Drill LOG_DEFAULTS_TO_LN, v3/v4 Teradata/Drill TABLE_HINTS, v5 Drill NULL_ORDERING, v6 _hash_raw_args, v7/v8 new dialect modules (probed unknown name; test-defined name). Selection cost c003640 / 107a4c3 / b2c241e: v3 10.57/27.45/3.62 s, v4 10.69/27.45/3.83, v5 10.69/26.97/3.75, v6 4.86/27.24/27.06, v7/v8 0/36.82/9.43. Full-suite truth running.
