@@ -38,8 +38,10 @@ BR_SRC=../sqlglot BR_KIT=../blast-radius-sample ../.venv313/bin/python -m unitte
 BR_SRC=../sqlglot BR_KIT=../blast-radius-sample ../.venv313/bin/python -m unittest test_selector_edgecases.EdgeCases.test_syntax_error_selects_everything   # run from tests/ or with -s tests
 
 # acceptance gate: working tree vs a git revision (default HEAD); PASS/FAIL + numbers
-python3 scripts/gate.py [--base 4bde6ef] [--allow-cost-increase]   # latter for correctness fixes
-# gate mutants = every ../stress*/ corpus; each needs truth/<id>.json or narrowed patches FAIL check 6
+# --stress defaults to ../stress ONLY: always pass every corpus explicitly
+ARGS=""; for d in ../stress*; do [ -d $d/truth ] && [ -d $d/commits ] && ARGS="$ARGS --stress $d"; done
+python3 scripts/gate.py --base <latest submitted sha> $ARGS [--allow-cost-increase]   # latter for correctness fixes
+# each corpus needs truth/<id>.json for every patch whose selection shrinks, or check 6 FAILs
 
 # cold-start CPU / RSS / simulated cost of a revision (WORKTREE or a git rev); run on an idle machine
 python3 scripts/bench.py --rev WORKTREE --kit ../blast-radius-sample --src ../sqlglot --python ../.venv313/bin/python --runs 5
@@ -70,7 +72,13 @@ python3 mapgen/iso_imp.py --src ../sqlglot --python $PWD/../.venv313/bin/python 
 export PATH=$HOME/.docker/bin:$PATH
 docker build --no-cache --platform linux/amd64 -t blast-radius-entry <dir with `git archive <sha>` output>
 cd ../blast-radius-sample && make -o build sample IMAGE=blast-radius-entry   # -o build: don't rebuild the kit's own Dockerfile
+# also run the image on the new corpus exactly as scored and `cmp` its stdout with the local selector's:
+#   the kit Makefile's RUN_FLAGS (--user 65534:65534 --read-only --network none --tmpfs /tmp:size=64m ...) with
+#   -v <corpus>/commits:/data/commits:ro -v <tests.json>:/data/tests.json:ro
 ```
+
+CPU: `bench.py` exports no `static_index.pkl`, so it measures the lazy path; the image always has the index
+(match `BR_SRC` exactly, or `load_static_index` ignores it). Time with `--build-index` output for image-like numbers.
 
 Selector env vars: `BR_DATA` (default `/data`), `BR_SRC` (pinned sources, `/opt/sqlglot` in the image),
 `BR_MAP` (`map.json.gz`), `BR_EQ` / `BR_VMAP` / `BR_HEAVY` / `BR_ISO` / `BR_IDX` (other data files, default next to
@@ -104,7 +112,14 @@ disable, for ablation only — never set in the image; any `BR_OFF` also skips t
   always selected). Most core import-time lines come from SQL templates parsed in class bodies
   (`generators/duckdb.py`, `typing/hive.py`).
 
-**Runtime (`selector.py`)** — per patch: parse the diff, apply hunks to `BR_SRC`, parse old/new with
+vtrace contexts matter for every value rule: anything evaluated while a sqlglot module body executes (including
+dialect modules imported lazily inside a test) is tagged `<import>`, and `<import>`/`<session>`/`<between>`/
+`<subprocess>` observations collapse into the per-entry "all tests" flag (`all`, `all_`, `unk[1]`) in `vmap.json.gz`;
+a value rule that sees a differing result under that flag returns `None` (falls through). Hot parser/tokenizer lines
+run at import only beneath SQL templates parsed in `generators/duckdb.py` and `typing/hive.py`, so value rules
+always fall through on them.
+
+**Runtime (`selector.py`)** — per patch: parse the diff (`parse_patch` only recognises `diff --git` sections), apply hunks to `BR_SRC`, parse old/new with
 `ast`, and let `Differ` find the smallest differing statements (comment/whitespace/docstring-only
 edits produce identical ASTs → nothing). Regions resolve to tests:
 `lines` (function bodies → coverage; import-time body lines → all tests), `lambda` (lambda bodies in
@@ -130,7 +145,9 @@ must be added to the `Dockerfile` COPY/chmod lines and to the export lists in `s
 
 Cost anatomy that drives priorities: `test_max_nodes` (28.8 s) and `test_execute_tpcds` (21.5 s) dominate.
 An ALL selection costs ≈36.8 s; most other commits cost ~2–5 s. Sample-only narrowing has repeatedly
-not moved the official score.
+not moved the official score: the sample has 0 ALL fallbacks, the hidden set (≈70 s more) has some. The sample's
+patches are single-token mutations (`is`/`==`, `==`/`!=`, `<`/`<=`, `and`/`or`, dropped `not`, int ±1, `True`/`False`,
+comments, fixture typos); expect the hidden set to look the same. Measure ALL fallbacks with `scripts/all_census.py`.
 
 ## Working conventions in this repo
 
@@ -140,7 +157,9 @@ not moved the official score.
   rule at a time; revert on FAIL; log every iteration (kept or reverted) in `EXPERIMENTS.md` with measured
   numbers only.
 - Official submissions are preserved (tags `submitted-BB-*`; full table in `EXPERIMENTS.md`). Best official
-  so far: 174.5 s, 0 misses (ddd9678, 8991e94, 01f0536); earlier champion 8238fd6 181.1 s. Never rewrite or
+  so far: 172.2 s, 0 misses (171.078 s simulated) for both v14 91c5abd (BB-A7FC9370) and v16 f84987c
+  (BB-9E4A99AD): v15's import-time isolation rule changed no hidden commit's cost, so local corpus savings are
+  not evidence of a hidden gain. Before: 174.5 s (ddd9678, 8991e94, 01f0536). Later results: `EXPERIMENTS.md`. Never rewrite or
   force-push submitted commits; new work goes on new `experiment/*` branches, one rule per branch.
 - Rejected approaches — do not revive without explicit approval: v10's runtime import-state subprocesses,
   and general per-file offline import-dependency narrowing (`experiment/importdeps-study`). The heavy-test

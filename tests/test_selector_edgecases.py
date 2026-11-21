@@ -61,6 +61,16 @@ class EdgeCases(unittest.TestCase):
                           read("sqlglot/dialects/dialect.py").replace("gen_cls.TRANSFORMS.pop(part, None)", "Generator.TRANSFORMS.pop(part, None)", 1)),
             "ival": udiff("sqlglot/dialects/dialect.py", read("sqlglot/dialects/dialect.py"),
                           read("sqlglot/dialects/dialect.py").replace("klass.INITCAP_SUPPORTS_CUSTOM_DELIMITERS = False", "klass.INITCAP_SUPPORTS_CUSTOM_DELIMITERS = True", 1)),
+            # class settings steering the metaclass's import-time TRANSFORMS.pop on a possibly inherited dict
+            # (stress_sa sa2, stress_sm sm1) vs an unrelated flip on the same class (stress_sm sm4)
+            "shsolr": udiff("sqlglot/generators/solr.py", read("sqlglot/generators/solr.py"),
+                            read("sqlglot/generators/solr.py").replace("class SolrGenerator(generator.Generator):\n",
+                                                                       "class SolrGenerator(generator.Generator):\n    SUPPORTED_JSON_PATH_PARTS = set()\n", 1)),
+            "shdune": udiff("sqlglot/generators/dune.py", read("sqlglot/generators/dune.py"),
+                            read("sqlglot/generators/dune.py").replace("    TRY_SUPPORTED = False\n",
+                                                                       "    TRY_SUPPORTED = False\n    SUPPORTED_JSON_PATH_PARTS = {exp.JSONPathKey, exp.JSONPathRoot}\n", 1)),
+            "shneg": udiff("sqlglot/generators/dune.py", read("sqlglot/generators/dune.py"),
+                           read("sqlglot/generators/dune.py").replace("    TRY_SUPPORTED = False\n", "    TRY_SUPPORTED = True\n", 1)),
             "hmut": udiff("sqlglot/parsers/spark2.py", read("sqlglot/parsers/spark2.py"),
                           read("sqlglot/parsers/spark2.py").replace("seq_get(args, 0), to=exp.DataType", "seq_get(args, 1), to=exp.DataType", 1)
                           .replace("from sqlglot.parsers.hive import HiveParser\n", "from sqlglot.parsers.hive import HiveParser\n\nexp.Select.EXTRA = 1\n", 1)),
@@ -212,6 +222,13 @@ class EdgeCases(unittest.TestCase):
         sel = self.sel["ival"]
         self.assertLess(len(sel), len(self.tests))
         self.assertIn(self.num("tests/dialects/test_dialect.py::TestDialect::test_lazy_load"), sel)
+
+    def test_shared_container_setting_selects_everything_untrimmed(self):
+        # sa2 truth: test_jsonpath x2 + test_exasol::test_json fail although they never import Solr alone;
+        # a process that imported it earlier shares the popped base Generator.TRANSFORMS -> no slow-test trim
+        self.assertEqual(len(self.sel["shsolr"]), len(self.tests))
+        self.assertEqual(len(self.sel["shdune"]), len(self.tests))
+        self.assertLess(len(self.sel["shneg"]), len(self.tests))
 
     def test_import_time_line_uses_isolated_coverage(self):
         # spark2 build_as_cast body runs at import (iso_imp.json.gz): tests whose own isolated run

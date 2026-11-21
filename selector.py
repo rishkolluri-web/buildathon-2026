@@ -87,6 +87,85 @@ def mutation_sites(tree):
     return sorted(sites)
 
 
+def shared_mutation_keys(fn):
+    """In-place mutations in function `fn` of a container reached through an attribute (x.Y.pop(..),
+    x.Y[k] = .., x.Y.update(..)): such a container may be inherited from a base class and shared. Returns
+    [(container attribute names, value keys)] per mutation: the value keys are attribute names / string
+    constants whose value flows into it (data or control dependence, intra-procedural, source-order
+    reaching definitions). Containers the function itself assigned
+    (X.Y = {...}) and containers reached only by subscripting a local name are private."""
+    loops = [(n.lineno, n.end_lineno) for n in ast.walk(fn) if isinstance(n, (ast.For, ast.AsyncFor, ast.While))]
+    defs = {}
+    for n in ast.walk(fn):
+        pairs = []
+        if isinstance(n, ast.Assign):
+            pairs = [(t, n.value) for t in n.targets]
+        elif isinstance(n, (ast.AnnAssign, ast.AugAssign)) and n.value is not None:
+            pairs = [(n.target, n.value)]
+        elif isinstance(n, (ast.For, ast.AsyncFor)):
+            pairs = [(n.target, n.iter)]
+        elif isinstance(n, ast.NamedExpr):
+            pairs = [(n.target, n.value)]
+        elif isinstance(n, (ast.With, ast.AsyncWith)):
+            pairs = [(i.optional_vars, i.context_expr) for i in n.items if i.optional_vars is not None]
+        for tgt, val in pairs:
+            stack = [tgt]
+            while stack:  # names rebound by the target (not x in `x.attr =` / `x[k] =`)
+                t = stack.pop()
+                if isinstance(t, ast.Name):
+                    defs.setdefault(t.id, []).append((getattr(val, "lineno", 0), val))
+                elif isinstance(t, (ast.Tuple, ast.List)):
+                    stack.extend(t.elts)
+                elif isinstance(t, ast.Starred):
+                    stack.append(t.value)
+
+    def keys_of(expr, line, seen):
+        ks = set()
+        for n in ast.walk(expr):
+            if isinstance(n, ast.Attribute):
+                ks.add(n.attr)
+            elif isinstance(n, ast.Constant) and isinstance(n.value, str):
+                ks.add(n.value)
+            elif isinstance(n, ast.Name) and (n.id, line) not in seen:
+                seen.add((n.id, line))
+                for dl, val in defs.get(n.id, ()):
+                    if dl < line or any(a <= line <= b and a <= dl <= b for a, b in loops):
+                        ks |= keys_of(val, getattr(val, "lineno", line), seen)
+        return ks
+
+    parents = {c: p for p in ast.walk(fn) for c in ast.iter_child_nodes(p)}
+    fresh = {ast.unparse(t) for n in ast.walk(fn) if isinstance(n, (ast.Assign, ast.AnnAssign))
+             for t in (n.targets if isinstance(n, ast.Assign) else [n.target]) if isinstance(t, ast.Attribute)}
+    out = []
+    for n in ast.walk(fn):
+        if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute) and n.func.attr in _MUTATORS:
+            recv, data = n.func.value, [*n.args, *[k.value for k in n.keywords]]
+        elif isinstance(n, ast.Subscript) and isinstance(n.ctx, (ast.Store, ast.Del)):
+            recv, data = n.value, [n.slice]
+        else:
+            continue
+        chain, r = [], recv
+        while isinstance(r, (ast.Attribute, ast.Subscript)):
+            chain.append(r)
+            r = r.value
+        if not any(isinstance(c, ast.Attribute) for c in chain) or ast.unparse(recv) in fresh:
+            continue  # local container, or one this function created
+        line = n.lineno
+        seen = set()
+        values = set()
+        for e in data:
+            values |= keys_of(e, line, seen)
+        p = parents.get(n)
+        while p is not None and p is not fn:  # control dependence on enclosing conditions / loops
+            if isinstance(p, (ast.If, ast.While, ast.IfExp)):
+                values |= keys_of(p.test, line, seen)
+            elif isinstance(p, (ast.For, ast.AsyncFor)):
+                values |= keys_of(p.iter, line, seen)
+            p = parents.get(p)
+        out.append(({c.attr for c in chain if isinstance(c, ast.Attribute)}, values))
+    return out
+
+
 def import_time_mutations(tree, imp_quals, dialect_keys):
     """True if code that runs while this module is imported could change state other modules see:
     stores/deletes into attributes or subscripts, mutating method calls, dynamic setattr/exec...,
@@ -1106,7 +1185,66 @@ class Selector:
         log(f"  {path}: class dict value change at {ov.lineno} entries {changed} -> {len(out)} reading tests")
         return out
 
-    STATIC = ("_fam_deps", "_derived", "_non_data", "_imp_uses", "_test_importers")
+    STATIC = ("_fam_deps", "_derived", "_non_data", "_imp_uses", "_test_importers", "_shared_mut")
+
+    def shared_mut_hit(self, old_tree, new_tree, qual):
+        """Names of class `qual` whose edit can steer an import-time in-place mutation of a shared
+        container: a changed/added/removed binding of a value key, or an added/removed binding of a
+        container key (the class starts/stops owning the container). Unresolvable class -> its
+        changed names are compared against both key sets."""
+        def body_bindings(tree):
+            node, parts = tree, qual.split(".") if qual else []
+            for p in parts:
+                node = next((s for s in getattr(node, "body", []) if isinstance(s, ast.ClassDef) and s.name == p), None)
+                if node is None:
+                    return None
+            out = {}
+            for st in node.body:
+                for nm in bound_names(st):
+                    out.setdefault(nm, []).append(ast.dump(st))
+            return out
+        a, b = body_bindings(old_tree), body_bindings(new_tree)
+        values, containers = self.shared_mut()
+        if a is None or b is None:
+            names = set(a or {}) | set(b or {})
+            return (names & values) | (names & containers)
+        changed = {nm for nm in set(a) | set(b) if a.get(nm) != b.get(nm)}
+        return (changed & values) | ((set(a) ^ set(b)) & containers)
+
+    def shared_mut(self):
+        """(value_keys, container_keys) over every function body that runs at import (map `imp`): class
+        settings whose value steers an import-time in-place mutation of a possibly inherited/shared
+        container, and the attributes holding such containers. See shared_mutation_keys."""
+        if "_shared_mut" not in self.__dict__:
+            # only a class attribute can be inherited and so shared between classes; instance state
+            # (expression.args, self.errors...) is per object
+            class_attrs = set()
+            for f in sorted((SRC / "sqlglot").rglob("*.py")):
+                tree = self.pinned_tree(str(f.relative_to(SRC)))
+                for c in ast.walk(tree) if tree is not None else ():
+                    if isinstance(c, ast.ClassDef):
+                        for st in c.body:  # bound with a value (an annotation alone declares instance state)
+                            if isinstance(st, ast.Assign) or (isinstance(st, ast.AnnAssign) and st.value is not None):
+                                class_attrs |= bound_names(st)
+            m = self.__dict__.get("m")
+            if m is not None:
+                imp = m.imp
+            else:  # --build-index runs without a loaded Map: read the import-time lines from the map file
+                with gzip.open(MAP, "rt") as f:
+                    imp = {k: set(v) for k, v in json.load(f).get("imp", {}).items()}
+            values, containers = set(), set()
+            for rel, lines in sorted(imp.items()):
+                tree = self.pinned_tree(rel)
+                if tree is None:
+                    continue
+                for fn in ast.walk(tree):
+                    if isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)) and (span(fn) - header_lines(fn)) & lines:
+                        for conts, vals in shared_mutation_keys(fn):
+                            if conts & class_attrs:
+                                values |= vals
+                                containers |= conts & class_attrs
+            self._shared_mut = (frozenset(values), frozenset(containers))
+        return self._shared_mut
 
     def load_static_index(self):
         import pickle
@@ -1134,6 +1272,7 @@ class Selector:
             keys |= {p.stem for p in (SRC / "sqlglot" / d).glob("*.py")}
         for k in sorted(keys):
             self.non_data_names(k)
+        self.shared_mut()
         if self.test_importers() is ALL:  # never ship a sentinel: recompute lazily (-> ALL) at run time
             raise SystemExit("test import graph unresolved at the pinned commit")
         idx = {k: self.__dict__[k] for k in self.STATIC}
@@ -1885,6 +2024,7 @@ class Selector:
                         # isolation (stress_sa sa1: gen_cls.TRANSFORMS.pop -> Generator.TRANSFORMS.pop)
                         # (the slow-test line trim has the same blind spot: plain ALL, as v14)
                         log(f"  {path}: import-time edit changes mutation targets -> all tests")
+                        self.no_trim = True
                         return ALL
                     if iso is not None:
                         # each test ran alone (collection, runtime, pool children): only a test whose
@@ -1903,6 +2043,17 @@ class Selector:
             elif r[0] == "lambda":
                 out |= self.m.nums(self.lines_bits(path, r[1]))
             elif r[0] == "class":
+                if not is_test_file and "sharedmut" not in OFF:
+                    hit = self.shared_mut_hit(old_tree, new_tree, r[1])
+                    if hit:
+                        # an import-time mutation of a possibly inherited container depends on this
+                        # setting (or on which class owns the container): it can reach every class
+                        # sharing that container (stress_sa sa2: SUPPORTED_JSON_PATH_PARTS -> pops from
+                        # the base Generator.TRANSFORMS)
+                        log(f"  {path}: class {r[1]} changes {sorted(hit)} steering import-time mutation "
+                            f"of shared containers -> all tests")
+                        self.no_trim = True  # importing this module anywhere in a process pollutes the
+                        return ALL           # shared container: closures of slow tests are no bound
                 if len(r) > 3 and r[3] == "pair" and not is_test_file:
                     dv = self.dict_value_change(path, r[2][0], r[2][1])
                     if dv is not None:
@@ -1977,6 +2128,7 @@ class Selector:
         chosen = set()
         trim = []  # sqlglot modules whose in-place edit alone forces ALL
         self.trim_lines = []  # (path, lines): import-time function-body lines (ALL unless trimmed)
+        self.no_trim = False  # set by rules whose ALL reaches shared state: never trimmed
         for f in files:
             path = f["new"] or f["old"]
             old_path = f["old"]
@@ -2007,7 +2159,7 @@ class Selector:
                 self.sole = len(files) == 1
                 r = self.py_change(path, old_text, f["new"] is None, f["hunks"])
                 if r is ALL:
-                    if (old_text is not None and f["new"] == old_path and f["hunks"]
+                    if (not self.no_trim and old_text is not None and f["new"] == old_path and f["hunks"]
                             and path.startswith("sqlglot/") and self.heavy_closures()):
                         trim.append((path, old_text, f["hunks"]))  # in-place module edit: maybe trimmable
                         continue

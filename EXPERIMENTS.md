@@ -261,3 +261,29 @@ Diagnosis: 3 official submissions at exactly 174.5 s while the sample improved. 
 - Reading: no hidden commit's busiest-worker load changed between v14 and v16, so the hidden set has no import-time
   function-body edit that v15's isolated coverage narrows enough to drop a slow test (or none at all). The remaining
   hidden excess over the sample (~70 s) is not reached by the v15/v16 rules.
+
+### experiment/sharedmut-v17 (base 8b67f16 = v16 f84987c + logs): guard class settings that steer import-time mutation of shared containers
+
+- Official BB-9E4A99AD (v16) = v14 to the millisecond: stop treating v15's local corpus savings as hidden-set evidence.
+- Miss fixed: ../stress_sa sa2 (SolrGenerator gains `SUPPORTED_JSON_PATH_PARTS = set()`; `_Dialect.__new__` then pops
+  every JSONPath transform from the TRANSFORMS dict SolrGenerator inherits = base Generator.TRANSFORMS; 3 failing tests
+  that never import Solr alone). v14, v15, v16 all selected 12 and missed all 3.
+- Rule (source-derived, no names hard-coded): `shared_mutation_keys(fn)` finds in-place mutations of containers reached
+  through an attribute (`x.Y.pop/update/...`, `x.Y[k] = / del`) in every function body that runs at import, minus
+  containers the function itself assigned and subscript chains on locals; per mutation, the attribute/string keys
+  whose value reaches it (source-order reaching definitions, comprehension scopes excluded, attribute stores are not
+  rebinds) or controls it (enclosing if/while/for). Kept only if the container name is a valued class attribute somewhere
+  in sqlglot (inheritable). Result at the pinned commit: containers {TRANSFORMS, _classes}; value keys include
+  SUPPORTED_JSON_PATH_PARTS, generator_class (plus generic registry-key names). A class-level edit that changes a
+  value-key binding, or adds/removes a container binding, -> plain ALL with `no_trim` (a process that imported the
+  module earlier shares the mutated container, so slow-test closures are no bound; the v16 sa1 guard sets it too).
+  Precomputed in static_index.pkl (`_shared_mut`); lazily otherwise.
+- Variant corpus ../stress_sm (scripts/sharedmut_mutations.py, full-suite truth, base 0 failing):
+  sm1 Dune inherits Trino TRANSFORMS + narrower set: 0 failing (v16 14 sel, v17 ALL); sm2 SQLite owned set drops
+  JSONPathSubscript: 3 failing (v16 696 sel 0 missed, v17 ALL); sm3 Solr own TRANSFORMS copy + empty set: 0 failing
+  (v16 12, v17 ALL); sm4 negative control Dune TRY_SUPPORTED False->True: 0 failing, guard does not fire (0 sel both).
+- Gate vs f84987c (22 corpora incl. stress_sa, stress_sm; --allow-cost-increase): PASS. 0/30 sample, 0/335 truth mutants,
+  unit tests 65 OK, fill 0.0 s, narrowed verified. Cost 5263.4 -> 5373.6 s (+110.3): only sa2, sm1, sm2, sm3 change
+  (each -> 36.817 s); the other 410 patches (incl. the whole sample) are byte-identical.
+- CPU with each revision's own static index (as in the image; 7 interleaved runs): v16 0.228 s, v17 0.231 s; outputs
+  identical. Without an index (bench.py's mode) v17 is 1.27 s vs 0.43 s (lazy class-attribute scan): image-irrelevant.
