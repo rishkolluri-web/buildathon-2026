@@ -50,6 +50,17 @@ class EdgeCases(unittest.TestCase):
         functions = read("sqlglot/expressions/functions.py")
         cls.patches = {
             "synt": udiff("sqlglot/optimizer/scope.py", scope, scope.replace("def traverse_scope(", "def traverse_scope((", 1)),
+            # trimmed ALL (heavy.json): ALL fallbacks in modules some slow tests never import
+            "hmy": udiff("sqlglot/parsers/mysql.py", read("sqlglot/parsers/mysql.py"),
+                         read("sqlglot/parsers/mysql.py").replace("            options.append(opt)\n", "            options.append(opt) )\n", 1)),
+            "hsp": udiff("sqlglot/parsers/spark2.py", read("sqlglot/parsers/spark2.py"),
+                         read("sqlglot/parsers/spark2.py").replace("seq_get(args, 0), to=exp.DataType", "seq_get(args, 1), to=exp.DataType", 1)),
+            "hmut": udiff("sqlglot/parsers/spark2.py", read("sqlglot/parsers/spark2.py"),
+                          read("sqlglot/parsers/spark2.py").replace("seq_get(args, 0), to=exp.DataType", "seq_get(args, 1), to=exp.DataType", 1)
+                          .replace("from sqlglot.parsers.hive import HiveParser\n", "from sqlglot.parsers.hive import HiveParser\n\nexp.Select.EXTRA = 1\n", 1)),
+            "hdk": udiff("sqlglot/parsers/spark2.py", read("sqlglot/parsers/spark2.py"),
+                         read("sqlglot/parsers/spark2.py").replace("seq_get(args, 0), to=exp.DataType", "seq_get(args, 1), to=exp.DataType", 1)
+                         .replace("from sqlglot.parsers.hive import HiveParser\n", "from sqlglot.parsers.hive import HiveParser\n\n\nclass Dialect_:\n    pass\n", 1)),
             "cmnt": udiff("sqlglot/helper.py", helper, helper.replace("\ndef ", "\n# just a note\ndef ", 1)),
             "newf": udiff("sqlglot/brand_new.py", None, "X = 1\n"),
             "ndia": udiff("sqlglot/dialects/myqsl.py", None,
@@ -176,6 +187,30 @@ class EdgeCases(unittest.TestCase):
         self.assertEqual(self.errors, [])
 
     def test_syntax_error_selects_everything(self):
+        self.assertEqual(len(self.sel["synt"]), len(self.tests))
+
+    def test_trimmed_all_keeps_importers_of_broken_module(self):
+        # parsers/mysql.py syntax error: full-suite truth (m068) fails test_execute_tpcds, whose
+        # spawned pool workers import it; test_max_nodes never imports it, in any process
+        sel = self.sel["hmy"]
+        self.assertIn(self.num("tests/test_executor.py::TestExecutor::test_execute_tpcds"), sel)
+        self.assertNotIn(self.num("tests/test_parser.py::TestParser::test_max_nodes"), sel)
+        self.assertIn(self.num("tests/test_generator.py::TestGenerator::test_generator_memory"), sel)
+        self.assertGreater(len(sel), len(self.tests) - 5)
+
+    def test_trimmed_all_import_time_line(self):
+        sel = self.sel["hsp"]
+        self.assertNotIn(self.num("tests/test_parser.py::TestParser::test_max_nodes"), sel)
+        self.assertGreater(len(sel), len(self.tests) - 5)
+
+    def test_trimmed_all_fails_closed_on_import_side_effects(self):
+        # import-time store into another module's object / a class that could replace a registered
+        # dialect: shared state every test can see -> plain ALL
+        self.assertEqual(len(self.sel["hmut"]), len(self.tests))
+        self.assertEqual(len(self.sel["hdk"]), len(self.tests))
+
+    def test_core_syntax_error_is_not_trimmed(self):
+        # optimizer/scope.py is imported by test_max_nodes: plain ALL
         self.assertEqual(len(self.sel["synt"]), len(self.tests))
 
     def test_deleted_module_selects_everything(self):

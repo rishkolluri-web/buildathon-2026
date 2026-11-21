@@ -37,11 +37,102 @@ IDX = Path(os.environ.get("BR_IDX", HERE / "static_index.pkl"))
 # Per-test value trace of the pinned suite (mapgen/vtrace.py): class-dict entry reads and
 # relational comparison outcomes.
 VMAP = Path(os.environ.get("BR_VMAP", HERE / "vmap.json.gz"))
+# Import closure of the slowest tests, each run alone (mapgen/heavy_closure.py): sqlglot modules
+# imported by their collection or execution, in any process.
+HEAVY = Path(os.environ.get("BR_HEAVY", HERE / "heavy.json"))
 
 WORKER_MS = 2000
 MAX_WORKERS = 8
 GLOBAL_CONFIG = {"pyproject.toml", "setup.cfg", "tox.ini", "pytest.ini", "conftest.py", "tests/conftest.py"}
 ALL = object()  # sentinel: select every test
+
+
+class TrimmedAll:
+    """Every test except `exclude`: slow tests that provably never import the changed module(s)."""
+
+    def __init__(self, exclude):
+        self.exclude = exclude
+
+
+# calls that can mutate an object they did not create (import-time side effects on shared state)
+_MUTATORS = {"update", "setdefault", "pop", "popitem", "append", "extend", "insert", "remove", "discard",
+             "add", "clear", "sort", "reverse", "__setitem__", "__delitem__", "__setattr__", "__delattr__",
+             "register", "difference_update", "intersection_update", "symmetric_difference_update"}
+_DYNAMIC = {"setattr", "delattr", "exec", "eval", "globals", "vars", "__import__", "compile", "locals"}
+
+
+def _norm(name):
+    return name.lower().replace("_", "")
+
+
+def import_time_mutations(tree, imp_quals, dialect_keys):
+    """True if code that runs while this module is imported could change state other modules see:
+    stores/deletes into attributes or subscripts, mutating method calls, dynamic setattr/exec...,
+    global/nonlocal, or a class whose name could replace a registered dialect (_Dialect registers
+    every subclass under its lower-cased name). Walks module and class bodies, decorators, defaults,
+    and every function body that runs at import (`imp_quals`, or called by name from import-time
+    code, transitively). Fail-closed: anything unrecognised counts as a mutation."""
+    funcs = {}
+
+    def collect(body, prefix):
+        for st in body:
+            if isinstance(st, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                funcs.setdefault(st.name, []).append(st)
+                funcs.setdefault(prefix + st.name, []).append(st)
+            elif isinstance(st, ast.ClassDef):
+                collect(st.body, prefix + st.name + ".")
+    collect(tree.body, "")
+    todo, done = [], set()
+
+    def bad_node(n):
+        if isinstance(n, (ast.Global, ast.Nonlocal)):
+            return True
+        if isinstance(n, (ast.Attribute, ast.Subscript)) and isinstance(n.ctx, (ast.Store, ast.Del)):
+            return True
+        if isinstance(n, ast.Call):
+            f = n.func
+            if isinstance(f, ast.Attribute) and (f.attr in _MUTATORS or f.attr.startswith("register")):
+                return True
+            if isinstance(f, ast.Name):
+                if f.id in _DYNAMIC or f.id.startswith("register"):
+                    return True
+                if f.id in funcs:
+                    todo.append(f.id)
+            if isinstance(f, ast.Attribute) and f.attr in ("import_module", "__import__"):
+                return True
+        if isinstance(n, ast.ClassDef) and (_norm(n.name) in dialect_keys or _norm(n.name) == "dialect"):
+            return True
+        return False
+
+    def walk_import_time(node):
+        """Nodes evaluated at import: everything except function (and lambda) bodies."""
+        stack = [node]
+        while stack:
+            n = stack.pop()
+            if bad_node(n):
+                return True
+            if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                stack.extend(n.decorator_list)
+                stack.extend(d for d in n.args.defaults + n.args.kw_defaults if d is not None)
+                continue
+            if isinstance(n, ast.Lambda):
+                stack.extend(d for d in n.args.defaults + n.args.kw_defaults if d is not None)
+                continue
+            stack.extend(ast.iter_child_nodes(n))
+        return False
+
+    if walk_import_time(tree):
+        return True
+    todo.extend(q for q in imp_quals if q in funcs)
+    while todo:
+        q = todo.pop()
+        if q in done:
+            continue
+        done.add(q)
+        for fn in funcs[q]:
+            if any(bad_node(n) for n in ast.walk(fn)):
+                return True
+    return False
 # Ablation switches for measuring each safety rule (never set in the image):
 # BR_OFF=imp,hdrimp,refs,classread,family,classhdr,argshdr,fixdir,fill
 OFF = set(filter(None, os.environ.get("BR_OFF", "").split(",")))
@@ -704,6 +795,64 @@ class Selector:
         if not OFF:  # ablation switches change import_uses/family results: never use the index then
             self.load_static_index()
         self._vmap = None
+
+    def heavy_closures(self):
+        """{test number: set of sqlglot modules its isolated run imports} for the slowest tests."""
+        if getattr(self, "_heavy", None) is None:
+            self._heavy = {}
+            if "heavyall" not in OFF:
+                try:
+                    c = json.loads(HEAVY.read_text())["closure"]
+                    self._heavy = {self.m.num_by_id[t]: set(mods) for t, mods in c.items()
+                                   if t in self.m.num_by_id and isinstance(mods, list) and mods}
+                except (OSError, ValueError, KeyError, TypeError, AttributeError) as e:
+                    log(f"heavy-test closures unavailable ({e!r})")
+        return self._heavy
+
+    def trimmed_all(self, trim, chosen):
+        """An ALL fallback caused only by in-place edits of the sqlglot modules in `trim`: drop each
+        slow test that (a) the other files' rules did not select, (b) never imports any of those
+        modules, in any process, when run alone, and (c) cannot see their import-time effects
+        through shared state (no import-time mutation of other objects, no dialect-name clash).
+        A module that is never imported cannot run, fail to compile, or change anything else; so
+        such a test runs exactly as on the pinned code. Anything unclear -> plain ALL."""
+        heavy = self.heavy_closures()
+        trees = []
+        for path, old_text, hunks in trim:
+            mod = module_name(path)
+            try:
+                old_tree = ast.parse(old_text)
+            except SyntaxError:
+                return ALL
+            imp = self.m.imp.get(path, set())
+            imp_quals = set()
+
+            def scan(body, prefix):
+                for st in body:
+                    if isinstance(st, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                        if (span(st) - header_lines(st)) & imp:  # body ran at import (headers always run)
+                            imp_quals.add(prefix + st.name)
+                    elif isinstance(st, ast.ClassDef):
+                        scan(st.body, prefix + st.name + ".")
+            scan(old_tree.body, "")
+            new_lines = apply_hunks(old_text.split("\n"), hunks)[0]
+            try:
+                new_tree = ast.parse("\n".join(new_lines))
+            except SyntaxError:
+                new_tree = None  # never compiles: only the old module's import effects disappear
+            trees.append((mod, imp_quals, [t for t in (old_tree, new_tree) if t is not None]))
+        exclude = set()
+        for h, clos in heavy.items():
+            if h in chosen:
+                continue
+            keys = {_norm(m.rsplit(".", 1)[1]) for m in clos if m.startswith("sqlglot.dialects.")}
+            if all(mod not in clos and not any(import_time_mutations(t, quals, keys) for t in ts)
+                   for mod, quals, ts in trees):
+                exclude.add(h)
+        if not exclude:
+            return ALL
+        log(f"  ALL minus {len(exclude)} slow test(s) that never import {[p for p, _, _ in trim]}")
+        return TrimmedAll(exclude)
 
     def vmap(self):
         """Per-test value trace (mapgen/vtrace.py), loaded on first use; False if unavailable."""
@@ -1722,6 +1871,7 @@ class Selector:
         if not files:
             return set()
         chosen = set()
+        trim = []  # sqlglot modules whose in-place edit alone forces ALL
         for f in files:
             path = f["new"] or f["old"]
             old_path = f["old"]
@@ -1752,6 +1902,10 @@ class Selector:
                 self.sole = len(files) == 1
                 r = self.py_change(path, old_text, f["new"] is None, f["hunks"])
                 if r is ALL:
+                    if (old_text is not None and f["new"] == old_path and f["hunks"]
+                            and path.startswith("sqlglot/") and self.heavy_closures()):
+                        trim.append((path, old_text, f["hunks"]))  # in-place module edit: maybe trimmable
+                        continue
                     return ALL
                 chosen |= r
             else:
@@ -1770,6 +1924,8 @@ class Selector:
                 if path.endswith(".py") and "/" in path and not path.startswith(("sqlglot/", "tests/")):
                     # e.g. sqlglotc/*.py: exercised by tests/test_sqlglotc.py
                     chosen |= self.file_tests(f"tests/test_{path.split('/', 1)[0]}.py")
+        if trim:
+            return self.trimmed_all(trim, chosen)
         return chosen
 
 
@@ -1836,6 +1992,8 @@ def main():
             chosen = ALL
         if chosen is ALL:
             chosen = every
+        elif isinstance(chosen, TrimmedAll):
+            chosen = every - chosen.exclude
         chosen = {n for n in chosen if n in ms}
         workers, cost = pack(chosen, ms)
         extra = 0

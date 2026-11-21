@@ -140,10 +140,10 @@ def main():
     shutil.copy(kit / "sample" / "tests.json", mdata / "tests.json")
     basedir = tmp / "base"
     basedir.mkdir()
-    for f in ("selector.py", "map.json.gz", "eqsites.json", "vmap.json.gz"):
+    for f in ("selector.py", "map.json.gz", "eqsites.json", "vmap.json.gz", "heavy.json"):
         p = subprocess.run(["git", "show", f"{a.base}:{f}"], cwd=REPO, capture_output=True)
         if p.returncode:
-            if f in ("eqsites.json", "vmap.json.gz"):  # absent in older revisions
+            if f in ("eqsites.json", "vmap.json.gz", "heavy.json"):  # absent in older revisions
                 continue
             raise SystemExit(f"git show {a.base}:{f} failed")
         (basedir / f).write_bytes(p.stdout)
