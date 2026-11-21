@@ -92,7 +92,7 @@ class EdgeCases(unittest.TestCase):
                                                                          '"GROUPS FOR USER": _show_parser("GROUPS FOR USER", target=False)', 1)),
             "dcall": udiff("sqlglot/parsers/singlestore.py", read("sqlglot/parsers/singlestore.py"),
                            read("sqlglot/parsers/singlestore.py").replace('"GROUPS FOR USER": _show_parser("GROUPS FOR USER", target=True)',
-                                                                          '"GROUPS FOR USER": _show_parser("GROUPS FOR USER", target=bool(1))', 1)),
+                                                                          '"GROUPS FOR USER": _show_parser("GROUPS FOR USER", target=bool(0))', 1)),
             "oplt": udiff("sqlglot/generators/clickhouse.py", read("sqlglot/generators/clickhouse.py"),
                           read("sqlglot/generators/clickhouse.py").replace("version < (23, 12) and unit", "version <= (23, 12) and unit", 1)),
             "opmix": udiff("sqlglot/generators/clickhouse.py", read("sqlglot/generators/clickhouse.py"),
@@ -100,6 +100,9 @@ class EdgeCases(unittest.TestCase):
                            .replace('return self.func("dateTrunc", unit,', 'return self.func("dateTrunX", unit,', 1)),
             "opeq": udiff("sqlglot/parsers/dremio.py", read("sqlglot/parsers/dremio.py"),
                           read("sqlglot/parsers/dremio.py").replace("        if len(args) == 2:\n", "        if len(args) != 2:\n", 1)),
+            # import-state rules: KEYWORDS is read at import AND at test time (tokens.py _init_core)
+            "kwdel": udiff("sqlglot/dialects/athena.py", read("sqlglot/dialects/athena.py"),
+                           read("sqlglot/dialects/athena.py").replace('        "UNLOAD": TokenType.COMMAND,\n', "", 1)),
             "nopt": udiff("sqlglot/optimizer/zz_rule.py", None, "def zz_rule(expression):\n    return expression\n"),
             "delf": udiff("sqlglot/dialects/tsql.py", tsql, None),
             "tfil": udiff("tests/test_transpile.py", transpile,
@@ -128,15 +131,16 @@ class EdgeCases(unittest.TestCase):
         for k, v in cls.patches.items():
             (data / "commits" / f"{k}.patch").write_text(v)
         env = dict(os.environ, BR_DATA=str(data), BR_SRC=SRC, BR_MAP=str(REPO / "map.json.gz"),
-                   BR_IDX=str(data / "none.pkl"))
+                   BR_IDX=str(data / "none.pkl"), BR_ISTATE=str(data / "import_state.json.gz"))
+        # build-time artefacts exactly as in the image: static index + post-import state reference
+        subprocess.run([sys.executable, str(REPO / "selector.py"), "--build-index", str(data / "static_index.pkl"),
+                        str(data / "import_state.json.gz")], env=env, capture_output=True, check=True)
         proc = subprocess.run([sys.executable, str(REPO / "selector.py")], env=env, capture_output=True)
         cls.stderr = proc.stderr.decode()
         assert proc.returncode == 0, cls.stderr
         cls.raw = proc.stdout
         # same patches with the build-time static index (as in the image) and with a corrupt one
         idx = data / "static_index.pkl"
-        subprocess.run([sys.executable, str(REPO / "selector.py"), "--build-index", str(idx)],
-                       env=env, capture_output=True, check=True)
         cls.raw_idx = subprocess.run([sys.executable, str(REPO / "selector.py")], env=dict(env, BR_IDX=str(idx)),
                                      capture_output=True, check=True).stdout
         (data / "bad.pkl").write_bytes(b"not a pickle")
@@ -303,6 +307,12 @@ class EdgeCases(unittest.TestCase):
         self.assertGreater(len(self.sel["opmix"]), 0)  # an extra edit in the file: normal coverage
         self.assertGreater(len(self.sel["opeq"]), 0)  # == -> != is not a traced relational site
         self.assertIn("comparison operator change", self.stderr)
+
+    def test_import_state_keeps_test_time_readers_of_import_read_names(self):
+        # regression (v10 development): the reference index files reads on function lines that also
+        # ran at import only as import-time reads; test_athena reads KEYWORDS via _init_core
+        nums = {t["number"] for t in self.tests if t["id"] == "tests/dialects/test_athena.py::TestAthena::test_athena"}
+        self.assertTrue(nums and nums <= self.sel["kwdel"])
 
     def test_static_index_changes_nothing(self):
         self.assertEqual(self.raw_idx, self.raw)  # build-time index == lazy computation

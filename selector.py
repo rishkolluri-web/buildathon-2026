@@ -34,11 +34,17 @@ EQ = Path(os.environ.get("BR_EQ", HERE / "eqsites.json"))
 # names), written at image build time by `selector.py --build-index` from the same BR_SRC.
 # Missing or unreadable -> computed lazily at runtime exactly as before.
 IDX = Path(os.environ.get("BR_IDX", HERE / "static_index.pkl"))
+# Post-import state of the pinned sources (selector.py --build-index ... <file>, at image build).
+ISTATE = Path(os.environ.get("BR_ISTATE", HERE / "import_state.json.gz"))
+# Import-state keys whose dict order varies between identical runs (identity-hashed set iteration),
+# measured over repeated runs of the pinned sources (scripts: selector.py --order-volatile).
+ORDER_VOLATILE = Path(os.environ.get("BR_ORDER_VOLATILE", HERE / "order_volatile.json"))
 # Per-test value trace of the pinned suite (mapgen/vtrace.py): class-dict entry reads and
 # relational comparison outcomes.
 VMAP = Path(os.environ.get("BR_VMAP", HERE / "vmap.json.gz"))
 
 WORKER_MS = 2000
+DERIVED_MIN_MS = 5000  # class rule selections cheaper than this are not worth a patched import
 MAX_WORKERS = 8
 GLOBAL_CONFIG = {"pyproject.toml", "setup.cfg", "tox.ini", "pytest.ini", "conftest.py", "tests/conftest.py"}
 ALL = object()  # sentinel: select every test
@@ -373,6 +379,13 @@ class Differ:
             self.regions.append(("lines", span(o)))
         else:
             self.regions.append(("module", [o], [n] if n is not None else None))
+
+
+def lambda_code_differs(o, n):
+    """Do two statements differ inside a lambda (or have lambdas at different places)?"""
+    la = [ast.dump(x) for x in ast.walk(o) if isinstance(x, ast.Lambda)]
+    lb = [ast.dump(x) for x in ast.walk(n) if isinstance(x, ast.Lambda)]
+    return la != lb
 
 
 def lambda_only_diff(o, n):
@@ -1259,6 +1272,169 @@ class Selector:
             self._dyn_pkgs = cache
         return cache
 
+    def sim_cost(self, nums):
+        ms = getattr(self, "ms", None)
+        return pack(nums, ms)[1] if ms else 10 ** 9
+
+    def module_path(self, mod):
+        rel = mod.replace(".", "/")
+        return f"{rel}.py" if (SRC / f"{rel}.py").is_file() else f"{rel}/__init__.py"
+
+    def import_state_diff(self, path):
+        """Keys of sqlglot's post-import state that this patch changes (see import_state), or ALL
+        (import fails, no reference). Once per patch: the patched package is imported in a
+        subprocess with every changed sqlglot file of the patch applied."""
+        if self._idiff is not None:
+            return self._idiff
+        self._idiff = ALL
+        if "istate" in OFF:
+            return ALL
+        try:
+            with gzip.open(ISTATE, "rt", encoding="utf-8") as fh:
+                st = json.load(fh)
+        except Exception as e:  # noqa: BLE001
+            log(f"  import state reference unavailable ({e!r})")
+            return ALL
+        patched = {}
+        for f in self.patch_files:
+            p = f["new"]
+            if f["binary"] or p is None or not p.endswith(".py"):
+                if (f["old"] or "").startswith("sqlglot/") or (p or "").startswith("sqlglot/"):
+                    return ALL
+                continue
+            if not p.startswith("sqlglot/"):
+                continue
+            old = (SRC / f["old"]).read_text(encoding="utf-8") if f["old"] else ""
+            patched[p] = "\n".join(apply_hunks(old.split("\n"), [[h[0], list(h[1])] for h in f["hunks"]])[0])
+        import subprocess
+
+        try:
+            proc = subprocess.run([sys.executable, str(Path(__file__).resolve()), "--import-state", str(SRC.resolve())],
+                                  input=json.dumps({"patched": patched}),
+                                  capture_output=True, text=True, timeout=120,
+                                  env=dict(os.environ, PYTHONHASHSEED=str(IMPORT_SEED)))
+            new = json.loads(proc.stdout)
+        except Exception as e:  # noqa: BLE001
+            log(f"  {path}: patched import failed to run ({e!r})")
+            return ALL
+        if "__error__" in new:
+            log(f"  {path}: patched import raises {new['__error__'][:120]}")
+            return ALL
+        ref, volatile, ovol = st["ref"], set(st["volatile"]), set(st["order_volatile"])
+
+        def differs(k):
+            a, b = ref.get(k), new.get(k)
+            if a is None or b is None:
+                return True  # added / removed
+            return a[16:] != b[16:] or (a[:16] != b[:16] and k not in ovol)
+
+        self._idiff = sorted(k for k in set(ref) | set(new) if k not in volatile and differs(k))
+        return self._idiff
+
+    def class_key(self, k):
+        """"mod:Qual.attr" (or "dyn:..." for a class reached through values) -> (module path,
+        "mod:Qual", attr); None for a module-global key "mod::name"."""
+        k2 = k[4:] if k.startswith("dyn:") else k
+        mod, rest = k2.split(":", 1)
+        if rest.startswith(":"):
+            return None
+        qual, attr = rest.rsplit(".", 1)
+        return self.module_path(mod), f"{mod}:{qual}", attr
+
+    def attr_readers(self, attr):
+        """Tests executing a runtime read of `.attr` / getattr(..., "attr"). The reference index's
+        runtime reads (rta) leave out function-body lines that ALSO ran during import (filed only as
+        import-time "body" reads); those lines run at test time too, so add the coverage of every
+        line in such a file that reads the name."""
+        e = self.m.refs.get(attr, {})
+        out = set()
+        for idx in e.get("rta", {}).values():
+            out |= self.m.nums(self.m.set(idx))
+        for ctx in e.get("impa", []) + e.get("impn", []):
+            if ctx[0] != "body":
+                continue  # class bodies / def headers / module statements: import only -> state diff
+            tree = self.pinned_tree(ctx[1])
+            lines = {n.lineno for n in ast.walk(tree) if (isinstance(n, ast.Attribute) and n.attr == attr)
+                     or (isinstance(n, ast.Name) and n.id == attr)
+                     or (isinstance(n, ast.Constant) and n.value == attr)} if tree else None
+            if lines is None:
+                tidx = self.m.touch.get(ctx[1])
+                out |= self.m.nums(self.m.set(tidx)) if tidx is not None else set()
+            else:
+                out |= self.m.nums(self.lines_bits(ctx[1], lines))
+        return out
+
+    def class_scope(self, mpath, cid):
+        idx = self.m.users.get(cid)
+        users = self.m.nums(self.m.set(idx)) if idx is not None else set()
+        users |= self.family_users(mpath)
+        tidx = self.m.touch.get(mpath)
+        return users, (self.m.nums(self.m.set(tidx)) if tidx is not None else set())
+
+    def derived_readers(self, path, stmts):
+        """Class-level data whose attribute names are read at import (derived state): the patched
+        import shows exactly which class attributes end up different; each can only be observed
+        by a runtime read of that attribute name on that class (or a subclass / its family / its
+        file), as in class_data_readers. None -> not applicable (normal class rule)."""
+        if "derived" in OFF or not stmts or not self.m.refs:
+            return None
+        for st in stmts:
+            b = bound_names(st) if isinstance(st, (ast.Assign, ast.AnnAssign)) else set()
+            if not b or "__complex_target__" in b:
+                return None
+        if len(stmts) == 2 and lambda_code_differs(stmts[0], stmts[1]):
+            return None  # fingerprints ignore code: a copied lambda's new body would be invisible
+        diff = self.import_state_diff(path)
+        if diff is ALL:
+            return None
+        out = set()
+        for k in diff:
+            ck = self.class_key(k)
+            if ck is None:
+                return None  # a module global changed: reference rules, not attribute readers
+            mpath, cid, attr = ck
+            if attr.startswith("__") or attr.endswith("_sql") or attr.startswith("_parse"):
+                return None  # generic dispatch / dunder protocol
+            users, touch = self.class_scope(mpath, cid)
+            out |= self.attr_readers(attr) & (users | touch)
+        log(f"  {path}: class data read at import: post-import state differs in {len(diff)} key(s) "
+            f"{diff[:4]} -> {len(out)} runtime readers")
+        return out
+
+    def import_diff(self, path, hit):
+        """Tests that can observe what this patch changes in sqlglot's post-import state (class
+        attributes -> class users + dialect family; module globals -> reference-index readers),
+        or ALL (import fails, no reference, unmappable difference)."""
+        diff = self.import_state_diff(path)
+        if diff is ALL:
+            return ALL
+        out = set()
+        for k in diff:
+            k2 = k[4:] if k.startswith("dyn:") else k
+            mod, rest = k2.split(":", 1)
+            mpath = self.module_path(mod)
+            if rest.startswith(":"):  # module global
+                r = self.name_users(mpath, {rest[1:]})
+                if r is ALL:
+                    log(f"  {path}: import-time change alters {k} -> all tests")
+                    return ALL
+                out |= r
+                continue
+            qual = rest.rsplit(".", 1)[0]
+            idx = self.m.users.get(f"{mod}:{qual}")
+            users = self.m.nums(self.m.set(idx)) if idx is not None else set()
+            users |= self.family_users(mpath)
+            if not users:
+                tidx = self.m.touch.get(mpath)
+                users = self.m.nums(self.m.set(tidx)) if tidx is not None else set()
+            if not users:
+                log(f"  {path}: import-time change alters {k} (no known users) -> all tests")
+                return ALL
+            out |= users
+        log(f"  {path}: import-time line(s) {sorted(hit)[:5]}: post-import state differs in {len(diff)} "
+            f"key(s) {diff[:4]} -> {len(out)} tests + line coverage")
+        return out
+
     def opened_by(self, path):
         idx = self.m.opens.get(path)
         return self.m.nums(self.m.set(idx)) if idx is not None else set()
@@ -1350,10 +1526,14 @@ class Selector:
             if r[0] == "lines":
                 hit = import_time(r[1]) if not is_test_file else None
                 if hit:
-                    # runs while sqlglot is imported (metaclass, __init_subclass__,
-                    # factories used in class bodies): every test inherits its effect
-                    log(f"  {path}: import-time line(s) {sorted(hit)[:5]} -> all tests")
-                    return ALL
+                    # runs while sqlglot is imported (metaclass, __init_subclass__, factories used
+                    # in class bodies): every test inherits its effect -> import the patched
+                    # package and see which state it leaves different (else: all tests)
+                    r2 = self.import_diff(path, hit)
+                    if r2 is ALL:
+                        log(f"  {path}: import-time line(s) {sorted(hit)[:5]} -> all tests")
+                        return ALL
+                    out |= r2
                 out |= self.m.nums(self.lines_bits(path, r[1]))
             elif r[0] == "lambda":
                 out |= self.m.nums(self.lines_bits(path, r[1]))
@@ -1379,6 +1559,14 @@ class Selector:
                     enum_like = enum_like_classes(old_tree)
                 readers = None if r[1] in enum_like else \
                     self.class_data_readers(path, r[2] if len(r) > 2 else None, is_test_file)
+                if readers is None and r[1] not in enum_like and not is_test_file and len(r) > 2 and r[2] \
+                        and all(st is not None for st in r[2]):
+                    old = users if users else self.m.nums(self.m.set(self.m.touch[path])) if path in self.m.touch else None
+                    # the patched import costs ~0.5 s CPU: only worth it when the class rule is expensive
+                    dr = self.derived_readers(path, r[2]) if old and self.sim_cost(old | out) > DERIVED_MIN_MS else None
+                    if dr is not None and len(dr) < len(old):
+                        out |= dr  # only ever used when narrower than the class rule below
+                        continue
                 if readers is not None:
                     # a class attribute that is never read at import can only be observed by
                     # executing a read of it (readers, by attribute NAME), on this class or a
@@ -1421,6 +1609,7 @@ class Selector:
     def select(self, patch_text):
         self.related = set()
         files = parse_patch(patch_text)
+        self.patch_files, self._idiff = files, None
         if not files:
             return set()
         chosen = set()
@@ -1525,6 +1714,7 @@ def main():
     sel_file = {t["number"]: t["file"] for t in tests}
     try:
         sel = Selector(Map(MAP, tests))
+        sel.ms = ms
     except Exception as e:  # no usable map: run everything rather than crash
         log(f"map unavailable ({e!r}); selecting all tests")
         sel = None
@@ -1553,8 +1743,219 @@ def main():
     log(f"estimated simulated cost without misses: {total / 1000:.3f}s")
 
 
+# ----------------------------------------------------------------------------- import state
+# Post-import state of the whole sqlglot package: every module global and every attribute of
+# every sqlglot class, fingerprinted. Code objects (and line numbers) are deliberately NOT part
+# of a fingerprint: a changed function body only matters where it runs, and its runs at test
+# time are covered by line coverage; what import-time execution can do beyond that is leave
+# different DATA behind (derived tables, registries, defaults, closure cells), which this sees.
+
+
+def _fp(x, seen, depth=0, unordered=False):
+    t = type(x)
+    if x is None or t in (bool, int, float, complex, str, bytes):
+        return f"{t.__name__}:{x!r}"
+    if depth > 12:
+        return "deep"
+    if id(x) in seen:
+        return "cycle"
+    import enum
+    import re as _re
+    import types
+
+    if isinstance(x, type):
+        if str(getattr(x, "__module__", "")).startswith("sqlglot"):
+            _REACHED.append(x)  # visited as a class too (dynamic classes live only in containers)
+        return f"type:{getattr(x, '__module__', '?')}.{getattr(x, '__qualname__', '?')}"
+    if isinstance(x, types.ModuleType):
+        return f"mod:{x.__name__}"
+    if isinstance(x, enum.Enum):
+        return f"enum:{t.__module__}.{t.__qualname__}.{x.name}={_fp(x.value, seen, depth + 1, unordered)}"
+    seen.add(id(x))
+    try:
+        if t in (tuple, list):
+            items = [_fp(e, seen, depth + 1, unordered) for e in x]
+            if unordered and t is list:
+                items.sort()
+            return f"{t.__name__}[" + ",".join(items) + "]"
+        if t in (set, frozenset):
+            return f"{t.__name__}{{" + ",".join(sorted(_fp(e, seen, depth + 1, unordered) for e in x)) + "}"
+        if isinstance(x, dict):
+            items = [f"{_fp(k, seen, depth + 1, unordered)}:{_fp(v, seen, depth + 1, unordered)}" for k, v in x.items()]
+            return f"{t.__module__}.{t.__qualname__}{{" + ",".join(sorted(items) if unordered else items) + "}"
+        if isinstance(x, types.FunctionType):
+            cells = []
+            for c in x.__closure__ or ():
+                try:
+                    cells.append(_fp(c.cell_contents, seen, depth + 1, unordered))
+                except ValueError:
+                    cells.append("empty")
+            return (f"fn:{x.__module__}.{x.__qualname__}(d={_fp(x.__defaults__, seen, depth + 1, unordered)},"
+                    f"kw={_fp(x.__kwdefaults__, seen, depth + 1, unordered)},c=[{','.join(cells)}],"
+                    f"a={_fp(dict(x.__dict__), seen, depth + 1, unordered)})")
+        if isinstance(x, (staticmethod, classmethod)):
+            return f"{t.__name__}({_fp(x.__func__, seen, depth + 1, unordered)})"
+        if isinstance(x, property):
+            return f"property({_fp(x.fget, seen, depth + 1, unordered)},{_fp(x.fset, seen, depth + 1, unordered)},{_fp(x.fdel, seen, depth + 1, unordered)})"
+        if isinstance(x, (types.BuiltinFunctionType, types.MethodWrapperType, types.WrapperDescriptorType,
+                          types.MethodDescriptorType, types.GetSetDescriptorType, types.MemberDescriptorType,
+                          types.ClassMethodDescriptorType)):
+            return f"builtin:{getattr(x, '__qualname__', repr(type(x)))}"
+        if isinstance(x, types.MethodType):
+            return f"method({_fp(x.__self__, seen, depth + 1, unordered)},{_fp(x.__func__, seen, depth + 1, unordered)})"
+        if isinstance(x, _re.Pattern):
+            return f"re:{x.pattern!r}:{x.flags}"
+        import functools
+
+        if isinstance(x, functools.partial):
+            return f"partial({_fp(x.func, seen, depth + 1, unordered)},{_fp(x.args, seen, depth + 1, unordered)},{_fp(x.keywords, seen, depth + 1, unordered)})"
+        state = {}
+        if hasattr(x, "__dict__"):
+            state.update(vars(x))
+        for cls in t.__mro__:
+            for s in getattr(cls, "__slots__", ()) if not isinstance(getattr(cls, "__slots__", ()), str) else (cls.__slots__,):
+                if s not in ("__dict__", "__weakref__") and hasattr(x, s):
+                    state[s] = getattr(x, s)
+        if state or hasattr(x, "__dict__") or hasattr(t, "__slots__"):
+            return f"obj:{t.__module__}.{t.__qualname__}{_fp(state, seen, depth + 1, unordered)}"
+        r = repr(x)
+        return f"opaque:{t.__module__}.{t.__qualname__}" + ("" if " at 0x" in r else f":{r}")
+    finally:
+        seen.discard(id(x))
+
+
+_REACHED = []
+IMPORT_SEED = 0
+SKIP_GLOBALS = {"__file__", "__cached__", "__spec__", "__loader__", "__builtins__", "__path__", "__package__", "__name__"}
+
+
+def import_state(root, patched=None):
+    """{key: ordered hash + order-insensitive hash (16 + 16 hex)} after importing every sqlglot
+    module from `root`, with `patched` ({relative path: source}) served instead of the files on
+    disk. Keys: "mod::name" for module globals, "mod:Qual.Name.attr" for class attributes
+    ("dyn:" prefix: classes reached only through values). Raises on any import failure."""
+    import hashlib
+    import importlib
+    import importlib.abc
+    import importlib.machinery
+    import pkgutil
+
+    patched = patched or {}
+    root = os.path.realpath(root)
+
+    class PatchedLoader(importlib.machinery.SourceFileLoader):
+        def get_data(self, path):
+            rel = os.path.relpath(path, root)
+            if rel in patched:
+                return patched[rel].encode("utf-8")
+            return super().get_data(path)
+
+        def path_stats(self, path):  # never trust a cached .pyc for a patched file
+            if os.path.relpath(path, root) in patched:
+                raise OSError("patched")
+            return super().path_stats(path)
+
+    class Finder(importlib.abc.MetaPathFinder):
+        def find_spec(self, fullname, path=None, target=None):
+            if fullname != "sqlglot" and not fullname.startswith("sqlglot."):
+                return None
+            base = os.path.join(root, *fullname.split("."))
+            for cand, pkg in ((os.path.join(base, "__init__.py"), True), (base + ".py", False)):
+                if os.path.isfile(cand) or os.path.relpath(cand, root) in patched:
+                    spec = importlib.machinery.ModuleSpec(fullname, PatchedLoader(fullname, cand), origin=cand,
+                                                          is_package=pkg)
+                    spec.has_location = True
+                    if pkg:
+                        spec.submodule_search_locations = [os.path.dirname(cand)]
+                    return spec
+            return None
+
+    sys.meta_path.insert(0, Finder())
+    sys.path.insert(0, root)
+    import sqlglot
+
+    names = sorted(m.name for m in pkgutil.walk_packages(sqlglot.__path__, "sqlglot.") if m.name != "sqlglot.__main__")
+    for rel in patched:  # brand-new modules are not on disk for walk_packages
+        if rel.startswith("sqlglot/") and rel.endswith(".py"):
+            names.append(module_name(rel))
+    for name in names:
+        importlib.import_module(name)
+    out = {}
+
+    def h(s):
+        return hashlib.blake2b(s.encode("utf-8", "surrogatepass"), digest_size=8).hexdigest()
+
+    visited = set()
+
+    def visit_class(mod, cls, prefix=""):
+        if id(cls) in visited:
+            return
+        visited.add(id(cls))
+        for k, v in list(vars(cls).items()):
+            if k in ("__dict__", "__weakref__", "__module__", "__qualname__"):
+                continue
+            if isinstance(v, type) and v.__module__ == mod and v.__qualname__.startswith(cls.__qualname__ + "."):
+                visit_class(mod, v, prefix)
+            out[f"{prefix}{mod}:{cls.__qualname__}.{k}"] = h(_fp(v, set())) + h(_fp(v, set(), unordered=True))
+
+    for mod in sorted(m for m in sys.modules if m == "sqlglot" or m.startswith("sqlglot.")):
+        g = vars(sys.modules[mod])
+        for k, v in list(g.items()):
+            if k in SKIP_GLOBALS:
+                continue
+            if isinstance(v, type) and v.__module__ == mod and "." not in v.__qualname__:
+                visit_class(mod, v)
+            out[f"{mod}::{k}"] = h(_fp(v, set())) + h(_fp(v, set(), unordered=True))
+    # classes reached only through values (created at import by factories/metaclasses and kept in
+    # registries, nested deeper than module globals): their attributes count too
+    while _REACHED:
+        c = _REACHED.pop()
+        if id(c) not in visited:
+            visit_class(c.__module__, c, "dyn:")
+    return out
+
+
+def build_import_state(root, out, runs=3):
+    """Image build: reference snapshot of the pinned sources (fixed hash seed IMPORT_SEED). Keys
+    whose ORDER varies between identical runs (dicts built by iterating identity-hashed sets: order
+    depends on memory layout) are listed as order-volatile, merged with ORDER_VOLATILE measured on
+    other machines; for them only the order-insensitive hash is compared. Keys whose content varies
+    between identical runs are ignored (volatile)."""
+    import subprocess
+
+    def run():
+        p = subprocess.run([sys.executable, __file__, "--import-state", root], input="{}", capture_output=True, text=True,
+                           env=dict(os.environ, PYTHONHASHSEED=str(IMPORT_SEED)), check=True)
+        r = json.loads(p.stdout)
+        if "__error__" in r:
+            raise SystemExit(f"pinned import failed: {r['__error__']}")
+        return r
+
+    rs = [run() for _ in range(runs)]
+    keys = set().union(*rs)
+    order_vol = {k for k in keys if len({r.get(k, "")[:16] for r in rs}) > 1}
+    volatile = sorted(k for k in keys if len({r.get(k, "")[16:] for r in rs}) > 1)
+    try:
+        order_vol |= set(json.loads(ORDER_VOLATILE.read_text()))
+    except (OSError, ValueError):
+        pass
+    ref = {k: v for k, v in rs[0].items() if k not in volatile}
+    with gzip.open(out, "wt", encoding="utf-8") as f:
+        json.dump({"ref": ref, "order_volatile": sorted(order_vol), "volatile": volatile}, f, separators=(",", ":"))
+    log(f"import state: {len(ref)} keys, {len(order_vol)} order-volatile, {len(volatile)} volatile -> {out}")
+
+
 if __name__ == "__main__":
-    if sys.argv[1:2] == ["--build-index"]:  # image build only (docker/Dockerfile), never at scoring time
+    if sys.argv[1:2] == ["--import-state"]:  # subprocess helper: argv[2] = src root, stdin = {path: source}
+        try:
+            req = json.loads(sys.stdin.read() or "{}")
+            res = import_state(sys.argv[2], req.get("patched", {}))
+            sys.stdout.write(json.dumps(res, separators=(",", ":")))
+        except BaseException as e:  # noqa: BLE001 - import broke: caller selects everything
+            sys.stdout.write(json.dumps({"__error__": repr(e)}))
+    elif sys.argv[1:2] == ["--build-index"]:  # image build only (docker/Dockerfile), never at scoring time
         Selector.__new__(Selector).build_static_index(sys.argv[2])
+        if len(sys.argv) > 3:
+            build_import_state(str(SRC), sys.argv[3])
     else:
         main()

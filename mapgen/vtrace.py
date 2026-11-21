@@ -164,6 +164,19 @@ def _vt_dict(site, d, keys):
     return v
 
 
+_PLAIN = (int, float, str, bytes, bool, type(None))
+
+
+def _plain(x, depth=0):
+    """Builtin value whose comparisons are pure (no user __lt__/__eq__, no side effects)."""
+    t = type(x)
+    if t in _PLAIN:
+        return True
+    if t in (tuple, list) and depth < 3 and len(x) <= 64:
+        return all(_plain(e, depth + 1) for e in x)
+    return False
+
+
 def _vt_cmp(site, a, b, op):
     ctx = _ctx()
     key = (site, ctx)
@@ -175,6 +188,13 @@ def _vt_cmp(site, a, b, op):
         _CMP_DONE[key] = _FULL
         raise
     if done == _FULL:
+        return r
+    if not (_plain(a) and _plain(b)):
+        # custom/unknown operand types: evaluating the other operators could run user code with
+        # side effects; never do it, and count every alternative as differing (conservative)
+        new = _FULL & ~done
+        _cmp_rec(site, ctx, new)
+        _CMP_DONE[key] = _FULL
         return r
     new = 0
     for j in range(6):
