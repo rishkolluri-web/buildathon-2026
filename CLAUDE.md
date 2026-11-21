@@ -62,7 +62,9 @@ MAPGEN_WORKERS=7 mapgen/run_coverage.sh ../sqlglot ../.venv313/bin/python ../map
 mapgen/run_eqtrace.sh ../sqlglot ../.venv313/bin/python ../eqoutX            # -> eqsites.json
 mapgen/run_vtrace.sh ../sqlglot ../.venv313/bin/python ../vtoutX ../blast-radius-sample/sample/tests.json  # -> vmap.json.gz (rejects incomplete traces)
 python3 mapgen/heavy_closure.py --src ../sqlglot --python $PWD/../.venv313/bin/python \
-    --tests ../blast-radius-sample/sample/tests.json --out heavy.json          # import closure of tests > 3 s
+    --tests ../blast-radius-sample/sample/tests.json --out heavy.json          # closure + lines of tests > 3 s
+python3 mapgen/iso_imp.py --src ../sqlglot --python $PWD/../.venv313/bin/python \
+    --tests ../blast-radius-sample/sample/tests.json --map map.json.gz --out iso_imp.json.gz --jobs 7  # ≈4 min
 
 # official Docker check, exactly as the scorer runs it (amd64; Docker CLI lives in ~/.docker/bin)
 export PATH=$HOME/.docker/bin:$PATH
@@ -71,7 +73,7 @@ cd ../blast-radius-sample && make -o build sample IMAGE=blast-radius-entry   # -
 ```
 
 Selector env vars: `BR_DATA` (default `/data`), `BR_SRC` (pinned sources, `/opt/sqlglot` in the image),
-`BR_MAP` (`map.json.gz`), `BR_EQ` / `BR_VMAP` / `BR_HEAVY` / `BR_IDX` (other data files, default next to
+`BR_MAP` (`map.json.gz`), `BR_EQ` / `BR_VMAP` / `BR_HEAVY` / `BR_ISO` / `BR_IDX` (other data files, default next to
 `selector.py`; each is optional — a missing file just disables its rules), `BR_OFF` (comma list of rules to
 disable, for ablation only — never set in the image; any `BR_OFF` also skips the static index).
 
@@ -96,7 +98,11 @@ disable, for ablation only — never set in the image; any `BR_OFF` also skips t
   traced execution. `vtrace.py` + `vtrace_plugin.py` (→ `vmap.json.gz`): per-test value trace — class-dict
   entry reads, relational comparison outcomes, comparison-constant operand values, UPPER_CASE attribute reads
   with owner class. `heavy_closure.py` (→ `heavy.json`): sqlglot modules each test > 3 s imports when run
-  alone, **including spawned pool children** (tpcds imports dialect parsers only in its workers).
+  alone, **including spawned pool children** (tpcds imports dialect parsers only in its workers), plus the
+  lines they execute. `iso_imp.py` (→ `iso_imp.json.gz`): every test run alone with coverage in all its
+  processes; per import-time line, the tests whose own run executes it (tests failing alone → `unknown`,
+  always selected). Most core import-time lines come from SQL templates parsed in class bodies
+  (`generators/duckdb.py`, `typing/hive.py`).
 
 **Runtime (`selector.py`)** — per patch: parse the diff, apply hunks to `BR_SRC`, parse old/new with
 `ast`, and let `Differ` find the smallest differing statements (comment/whitespace/docstring-only
@@ -108,7 +114,8 @@ class dicts → coverage), `class` (class-level data → class users ∪ dialect
 Syntax errors, deleted/renamed modules, pytest config, analysis exceptions → **every test** (never crash).
 Value-sensitive rules run before the generic ones and return `None` to fall through: `swap_only_sites`
 (eq swaps), `op_change` (operator edits), `const_change` (comparison constants), `dict_value_change`,
-`traced_attr_readers` (class settings). An ALL caused only by in-place edits of sqlglot modules becomes
+`traced_attr_readers` (class settings). An import-time function-body line selects coverage ∪ the tests whose
+isolated run executes it (`iso_tests`) instead of ALL. An ALL caused only by in-place edits of sqlglot modules becomes
 `trimmed_all()` (a `TrimmedAll` sentinel): every test minus slow tests whose closure excludes the module,
 fail-closed on import-time side effects (`import_time_mutations`). Test-file edits resolve through the static
 `tests/` import graph (`test_importers`). Pure static analyses are precomputed at image build

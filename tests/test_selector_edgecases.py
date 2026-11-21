@@ -198,10 +198,16 @@ class EdgeCases(unittest.TestCase):
         self.assertIn(self.num("tests/test_generator.py::TestGenerator::test_generator_memory"), sel)
         self.assertGreater(len(sel), len(self.tests) - 5)
 
-    def test_trimmed_all_import_time_line(self):
+    def test_import_time_line_uses_isolated_coverage(self):
+        # spark2 build_as_cast body runs at import (iso_imp.json.gz): tests whose own isolated run
+        # executes it. Full-suite truth for this edit (stress_k iop-spark2-18): these two fail.
         sel = self.sel["hsp"]
+        self.assertIn(self.num("tests/dialects/test_spark.py::TestSpark::test_spark"), sel)
+        self.assertIn(self.num("tests/dialects/test_spark.py::TestSpark::test_string"), sel)
         self.assertNotIn(self.num("tests/test_parser.py::TestParser::test_max_nodes"), sel)
-        self.assertGreater(len(sel), len(self.tests) - 5)
+        # a test with no isolated run (fails alone) is always selected
+        self.assertIn(self.num("tests/dialects/test_dialect.py::TestDialect::test_lazy_load"), sel)
+        self.assertLess(len(sel), len(self.tests))
 
     def test_trimmed_all_fails_closed_on_import_side_effects(self):
         # import-time store into another module's object / a class that could replace a registered

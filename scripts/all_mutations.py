@@ -67,6 +67,9 @@ def main():
     ap.add_argument("--n", type=int, default=32)
     ap.add_argument("--seed", type=int, default=20261121)
     ap.add_argument("--kinds", default="syn,itb,mod,ops", help="comma list of mutation kinds to generate")
+    ap.add_argument("--core", action="store_true", help="only modules INSIDE the smallest heavy closure")
+    ap.add_argument("--marker", default="ALL minus", help="keep candidates whose selector log contains this")
+    ap.add_argument("--per-file", type=int, default=2)
     a = ap.parse_args()
     kinds_on = set(a.kinds.split(","))
     rnd = random.Random(a.seed)
@@ -78,7 +81,7 @@ def main():
     for f in sorted((src / "sqlglot").rglob("*.py")):
         rel = str(f.relative_to(src))
         mod = rel[:-3].replace("/", ".").removesuffix(".__init__")
-        if mod in smallest:
+        if (mod in smallest) != a.core:
             continue
         text = f.read_text()
         lines = text.split("\n")
@@ -133,7 +136,7 @@ def main():
         r = subprocess.run([a.python, str(REPO / "selector.py")], env=env, capture_output=True, text=True)
     trimmed, pending = set(), False
     for line in r.stderr.splitlines():
-        if "ALL minus" in line:
+        if a.marker in line:
             pending = True
         elif ": " in line and " tests (" in line:
             cid = line.split(":", 1)[0]
@@ -144,7 +147,7 @@ def main():
     meta, per = {}, {}
     for cid in sorted(trimmed, key=lambda c: int(c[1:])):
         kind, rel, ln, patch = ids[cid]
-        if len(meta) >= a.n or per.get((kind, rel), 0) >= 2:
+        if len(meta) >= a.n or per.get((kind, rel), 0) >= a.per_file:
             continue
         per[(kind, rel)] = per.get((kind, rel), 0) + 1
         mid = f"{kind}-{Path(rel).parent.name}-{Path(rel).stem}-{ln}"

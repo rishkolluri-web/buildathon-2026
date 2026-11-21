@@ -40,6 +40,8 @@ VMAP = Path(os.environ.get("BR_VMAP", HERE / "vmap.json.gz"))
 # Import closure of the slowest tests, each run alone (mapgen/heavy_closure.py): sqlglot modules
 # imported by their collection or execution, in any process.
 HEAVY = Path(os.environ.get("BR_HEAVY", HERE / "heavy.json"))
+# Import-time lines executed by each test's own isolated run (mapgen/iso_imp.py).
+ISO = Path(os.environ.get("BR_ISO", HERE / "iso_imp.json.gz"))
 
 WORKER_MS = 2000
 MAX_WORKERS = 8
@@ -788,6 +790,7 @@ class Selector:
     def __init__(self, m: Map):
         self.m = m
         self.sole = False
+        self.trim_lines = []
         try:  # comparison sites where is/== are interchangeable on every traced execution
             self.eq_safe = set(json.loads(EQ.read_text())["safe"]) if "eqswap" not in OFF else set()
         except (OSError, ValueError, KeyError):
@@ -808,6 +811,64 @@ class Selector:
                 except (OSError, ValueError, KeyError, TypeError, AttributeError) as e:
                     log(f"heavy-test closures unavailable ({e!r})")
         return self._heavy
+
+    def iso_tests(self, path, lines):
+        """Tests whose isolated run executes any of `lines` of `path` (import time or runtime), plus every
+        test without an isolated run; None when the data is unavailable (callers fall back to ALL)."""
+        if getattr(self, "_iso", None) is None:
+            self._iso = False
+            if "isoimp" not in OFF:
+                try:
+                    with gzip.open(ISO, "rt", encoding="utf-8") as f:
+                        v = json.load(f)
+                    known = set(v["tests"]) - set(v["unknown"])
+                    self._iso = {
+                        "bit_to_num": [self.m.num_by_id.get(t) for t in v["tests"]],
+                        "lines": v["lines"], "sets": v["sets"], "cache": {},
+                        "missing": {n for t, n in self.m.num_by_id.items() if t not in known},
+                    }
+                except Exception as e:  # noqa: BLE001 - no data: import-time lines -> ALL as before
+                    log(f"isolated import-time coverage unavailable ({e!r})")
+        iso = self._iso
+        if not iso:
+            return None
+        bits = 0
+        per = iso["lines"].get(path, {})
+        for ln in lines:
+            idx = per.get(str(ln))
+            if idx is not None:
+                b = iso["cache"].get(idx)
+                if b is None:
+                    b = iso["cache"][idx] = int(iso["sets"][idx], 16)
+                bits |= b
+        out = set(iso["missing"])
+        i = 0
+        while bits:
+            if bits & 1:
+                n = iso["bit_to_num"][i]
+                if n is not None:
+                    out.add(n)
+            bits >>= 1
+            i += 1
+        return out
+
+    def heavy_lines(self):
+        """{test number: {path: set of lines}}: every sqlglot line each slow test's isolated run executes
+        (collection, runtime and spawned pool children, import time included)."""
+        if getattr(self, "_heavy_lines", None) is None:
+            self._heavy_lines = {}
+            if "heavyall" not in OFF and self.heavy_closures():
+                try:
+                    raw = json.loads(HEAVY.read_text())["lines"]
+                    self._heavy_lines = {
+                        self.m.num_by_id[t]: {f: {n for a, b in rs for n in range(a, b + 1)} for f, rs in files.items()}
+                        for t, files in raw.items() if t in self.m.num_by_id and files}
+                    if set(self._heavy_lines) != set(self.heavy_closures()):
+                        self._heavy_lines = {}
+                except (OSError, ValueError, KeyError, TypeError, AttributeError) as e:
+                    log(f"heavy-test lines unavailable ({e!r})")
+                    self._heavy_lines = {}
+        return self._heavy_lines
 
     def trimmed_all(self, trim, chosen):
         """An ALL fallback caused only by in-place edits of the sqlglot modules in `trim`: drop each
@@ -842,16 +903,20 @@ class Selector:
                 new_tree = None  # never compiles: only the old module's import effects disappear
             trees.append((mod, imp_quals, [t for t in (old_tree, new_tree) if t is not None]))
         exclude = set()
+        hl = self.heavy_lines() if self.trim_lines else {}
         for h, clos in heavy.items():
             if h in chosen:
                 continue
+            if self.trim_lines and (h not in hl or any(lines & hl[h].get(p, set()) for p, lines in self.trim_lines)):
+                continue  # the slow test's own run executes a changed import-time line
             keys = {_norm(m.rsplit(".", 1)[1]) for m in clos if m.startswith("sqlglot.dialects.")}
             if all(mod not in clos and not any(import_time_mutations(t, quals, keys) for t in ts)
                    for mod, quals, ts in trees):
                 exclude.add(h)
         if not exclude:
             return ALL
-        log(f"  ALL minus {len(exclude)} slow test(s) that never import {[p for p, _, _ in trim]}")
+        log(f"  ALL minus {len(exclude)} slow test(s) that never import {[p for p, _, _ in trim]}"
+            f" nor execute changed import-time lines in {sorted({p for p, _ in self.trim_lines})}")
         return TrimmedAll(exclude)
 
     def vmap(self):
@@ -1792,9 +1857,21 @@ class Selector:
                 hit = import_time(r[1]) if not is_test_file else None
                 if hit:
                     # runs while sqlglot is imported (metaclass, __init_subclass__,
-                    # factories used in class bodies): every test inherits its effect
-                    log(f"  {path}: import-time line(s) {sorted(hit)[:5]} -> all tests")
-                    return ALL
+                    # factories used in class bodies)
+                    iso = self.iso_tests(path, r[1])
+                    if iso is not None:
+                        # each test ran alone (collection, runtime, pool children): only a test whose
+                        # own run executes the line can see what it computes at import or at runtime
+                        log(f"  {path}: import-time line(s) {sorted(hit)[:5]} -> {len(iso)} tests executing them in isolation")
+                        out |= iso | self.m.nums(self.lines_bits(path, r[1]))
+                        continue
+                    if "heavylines" in OFF or not self.heavy_lines():
+                        log(f"  {path}: import-time line(s) {sorted(hit)[:5]} -> all tests")
+                        return ALL
+                    # every test, except slow tests whose own run (collection, runtime, pool children)
+                    # never executes these lines: see trimmed_all
+                    log(f"  {path}: import-time line(s) {sorted(hit)[:5]} -> all tests (trimmable)")
+                    self.trim_lines.append((path, set(r[1])))
                 out |= self.m.nums(self.lines_bits(path, r[1]))
             elif r[0] == "lambda":
                 out |= self.m.nums(self.lines_bits(path, r[1]))
@@ -1872,6 +1949,7 @@ class Selector:
             return set()
         chosen = set()
         trim = []  # sqlglot modules whose in-place edit alone forces ALL
+        self.trim_lines = []  # (path, lines): import-time function-body lines (ALL unless trimmed)
         for f in files:
             path = f["new"] or f["old"]
             old_path = f["old"]
@@ -1924,7 +2002,7 @@ class Selector:
                 if path.endswith(".py") and "/" in path and not path.startswith(("sqlglot/", "tests/")):
                     # e.g. sqlglotc/*.py: exercised by tests/test_sqlglotc.py
                     chosen |= self.file_tests(f"tests/test_{path.split('/', 1)[0]}.py")
-        if trim:
+        if trim or self.trim_lines:
             return self.trimmed_all(trim, chosen)
         return chosen
 

@@ -22,7 +22,7 @@ import time
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
-FILES = ("selector.py", "map.json.gz", "eqsites.json", "vmap.json.gz", "heavy.json")
+FILES = ("selector.py", "map.json.gz", "eqsites.json", "vmap.json.gz", "heavy.json", "iso_imp.json.gz")
 
 
 def export(rev, dest):
