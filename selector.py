@@ -555,6 +555,7 @@ def op_change_sites(old_tree, new_tree, touched):
     return sites or None
 
 
+_UPPER_NAME = re.compile(r"[A-Z][A-Z0-9_]*\Z")
 _CV_OPS = {ast.Lt: "lt", ast.LtE: "le", ast.Gt: "gt", ast.GtE: "ge", ast.Eq: "eq", ast.NotEq: "ne"}
 
 
@@ -991,7 +992,41 @@ class Selector:
                 out |= r
         return out
 
-    def class_data_readers(self, path, stmts, is_test_file):
+    def traced_attr_readers(self, path, qual, nm):
+        """Tests whose execution actually evaluated a read of attribute `nm` whose value came from class
+        `qual` of `path` (traced: mapgen/vtrace.py, owner = defining class in the lookup MRO), plus reads
+        with an unresolvable owner, untraced tests, and every test of a test file mentioning the name
+        (test code is not instrumented). None -> not established (use the static index)."""
+        v = self.vmap()
+        if not v or "attr" not in v or "attrtrace" in OFF or not _UPPER_NAME.match(nm):
+            return None
+        per = v["attr"].get(nm, {})
+        owner = f"{module_name(path)}:{qual}"
+        out = set(v["bit_to_num"][i] for i in v.get("untraced", []) if v["bit_to_num"][i] is not None)
+        for o in (owner, "?"):
+            if o in per:
+                idx, all_ = per[o]
+                if all_:
+                    return None  # read at import / session / subprocess: derived or shared state
+                out |= self.vnums(v, idx)
+        out |= self.test_files_mentioning(nm)
+        return out
+
+    def test_files_mentioning(self, nm):
+        cache = self.__dict__.setdefault("_mention", {})
+        if nm not in cache:
+            hit = set()
+            pat = re.compile(r"\b%s\b" % re.escape(nm))
+            for f in sorted((SRC / "tests").rglob("*.py")) if (SRC / "tests").is_dir() else []:
+                try:
+                    if pat.search(f.read_text(encoding="utf-8")):
+                        hit |= self.file_tests(str(f.relative_to(SRC)))
+                except OSError:
+                    return set(self.m.bit_to_num) - {None}
+            cache[nm] = hit
+        return cache[nm]
+
+    def class_data_readers(self, path, stmts, is_test_file, qual=None):
         """Tests that execute a runtime read of the class attributes bound by `stmts`,
         or None when that is not a safe bound (import-time reads, non-data statements,
         private/dunder or method-like names, unknown statements)."""
@@ -1012,6 +1047,10 @@ class Selector:
             e = self.m.refs.get(nm, {})
             if e.get("impa") or e.get("impn"):
                 return None  # read while classes/modules are built: derived state
+            traced = self.traced_attr_readers(path, qual, nm) if qual else None
+            if traced is not None:
+                out |= traced  # reads that actually executed (a covered line need not evaluate them)
+                continue
             for idx in e.get("rta", {}).values():
                 out |= self.m.nums(self.m.set(idx))
         return out
@@ -1631,7 +1670,7 @@ class Selector:
                 if enum_like is None:
                     enum_like = enum_like_classes(old_tree)
                 readers = None if r[1] in enum_like else \
-                    self.class_data_readers(path, r[2] if len(r) > 2 else None, is_test_file)
+                    self.class_data_readers(path, r[2] if len(r) > 2 else None, is_test_file, r[1])
                 if readers is not None:
                     # a class attribute that is never read at import can only be observed by
                     # executing a read of it (readers, by attribute NAME), on this class or a

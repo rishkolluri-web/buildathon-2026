@@ -46,6 +46,45 @@ _OPNAMES = ("Lt", "LtE", "Gt", "GtE", "Eq", "NotEq")
 _REL = {ast.Lt: 0, ast.LtE: 1, ast.Gt: 2, ast.GtE: 3}
 _ALL6 = {ast.Lt: 0, ast.LtE: 1, ast.Gt: 2, ast.GtE: 3, ast.Eq: 4, ast.NotEq: 5}
 CV = {}  # site -> {ctx: set of observed non-constant operand values, or "U" (unknown)}
+AR = {}  # UPPER_CASE attribute name -> {owner "module:Qual" | "?" : set(ctx)} for reads that executed
+_UPPER = __import__("re").compile(r"[A-Z][A-Z0-9_]*\Z")
+
+
+def _owner(recv, name):
+    """Where the value of recv.<name> comes from: the class in the lookup MRO whose __dict__ holds it
+    ("inst" for an instance attribute, "?" when unresolvable: custom __getattr__, super(), proxies)."""
+    try:
+        if isinstance(recv, type):
+            mro = recv.__mro__
+        else:
+            d = getattr(recv, "__dict__", None)
+            if isinstance(d, dict) and name in d:
+                return "inst"
+            mro = type(recv).__mro__
+        for c in mro:
+            if name in vars(c):
+                return f"{c.__module__}:{c.__qualname__}"
+    except Exception:  # noqa: BLE001
+        pass
+    return "?"
+
+
+def _attr_rec(recv, name):
+    ctx = _ctx()
+    AR.setdefault(name, {}).setdefault(_owner(recv, name), set()).add(ctx)
+
+
+def _vt_attr(recv, name):
+    v = getattr(recv, name)  # the one lookup recv.<name> would do (same descriptors / exceptions)
+    _attr_rec(recv, name)
+    return v
+
+
+def _vt_getattr(fn, obj, name, *rest):
+    r = fn(obj, name, *rest)
+    if type(name) is str and _UPPER.match(name):
+        _attr_rec(obj, name)
+    return r
 CV_MAX = 64  # distinct values per (site, context); beyond -> "U"
 _PLAIN = (int, float, str, bytes, bool, type(None))
 
@@ -269,7 +308,9 @@ class _Rewrite(ast.NodeTransformer):
         self.rel = rel
 
     def visit_ClassDef(self, node):
-        self.generic_visit(node)
+        # decide eligibility and capture the original key expressions BEFORE the children are rewritten
+        # (attribute reads inside keys become __vt_attr__ calls)
+        plan = {}
         for st in node.body:
             if isinstance(st, ast.Assign) and len(st.targets) == 1 and isinstance(st.targets[0], ast.Name):
                 val = st.value
@@ -282,12 +323,36 @@ class _Rewrite(ast.NodeTransformer):
             explicit = [k for k in val.keys if k is not None]
             if not all(_plain_key(k) for k in explicit):
                 continue
-            site = f"{self.rel}:{val.lineno}:{val.col_offset}"
+            plan[id(st)] = (f"{self.rel}:{val.lineno}:{val.col_offset}", [ast.unparse(k) for k in explicit])
+        self.generic_visit(node)
+        for st in node.body:
+            if id(st) not in plan:
+                continue
+            site, keys = plan[id(st)]
+            val = st.value
             call = ast.Call(func=ast.Name(id="__vt_dict__", ctx=ast.Load()),
                             args=[ast.Constant(site), val,
-                                  ast.Tuple(elts=[_copy_load(k) for k in explicit], ctx=ast.Load())],
+                                  ast.Tuple(elts=[ast.parse(k, mode="eval").body for k in keys], ctx=ast.Load())],
                             keywords=[])
             st.value = ast.copy_location(call, val)
+        return node
+
+    def visit_Attribute(self, node):
+        self.generic_visit(node)
+        if isinstance(node.ctx, ast.Load) and _UPPER.match(node.attr):
+            call = ast.Call(func=ast.Name(id="__vt_attr__", ctx=ast.Load()),
+                            args=[node.value, ast.Constant(node.attr)], keywords=[])
+            return ast.copy_location(call, node)
+        return node
+
+    def visit_Call(self, node):
+        self.generic_visit(node)
+        f = node.func
+        if isinstance(f, ast.Name) and f.id in ("getattr", "hasattr") and not node.keywords \
+                and 2 <= len(node.args) <= 3 and not any(isinstance(a, ast.Starred) for a in node.args):
+            call = ast.Call(func=ast.Name(id="__vt_getattr__", ctx=ast.Load()),
+                            args=[ast.Name(id=f.id, ctx=ast.Load())] + node.args, keywords=[])
+            return ast.copy_location(call, node)
         return node
 
     def visit_Compare(self, node):
@@ -324,6 +389,8 @@ class _Loader(importlib.machinery.SourceFileLoader):
     def exec_module(self, module):
         module.__dict__["__vt_dict__"] = _vt_dict
         module.__dict__["__vt_cmp__"] = _vt_cmp
+        module.__dict__["__vt_attr__"] = _vt_attr
+        module.__dict__["__vt_getattr__"] = _vt_getattr
         _IMPORTING[0] += 1
         try:
             super().exec_module(module)
@@ -366,6 +433,7 @@ def _dump():
         "cv": {s: {c: (v if v == "U" else sorted(v, key=lambda x: (type(x).__name__, x))) for c, v in d.items()}
                for s, d in CV.items()},
         "done": sorted(DONE),
+        "attr": {n: {o: sorted(c) for o, c in d.items()} for n, d in AR.items()},
     }
     with open(os.path.join(out, f"vt-{os.getpid()}.json"), "w") as f:
         json.dump(data, f)
@@ -395,6 +463,7 @@ def merge(indir, tests_json, outfile):
         by_file.setdefault(t.split("::")[0], set()).add(i)
     dreads, dmeta, cmp, seen = {}, {}, {}, set()
     cvals, done = {}, set()  # site -> {("int"|"str", value) | "U": set(ctx)}
+    areads = {}
     for name in sorted(os.listdir(indir)):
         if not name.startswith("vt-"):
             continue
@@ -410,6 +479,9 @@ def merge(indir, tests_json, outfile):
                 cmp.setdefault(s, {}).setdefault(j, set()).update(c)
         seen.update(d["cmp_seen"])
         done.update(d.get("done", ()))
+        for n, per in d.get("attr", {}).items():
+            for o, c in per.items():
+                areads.setdefault(n, {}).setdefault(o, set()).update(c)
         for site, per in d.get("cv", {}).items():
             e = cvals.setdefault(site, {})
             for ctx, vals in per.items():
@@ -474,6 +546,7 @@ def merge(indir, tests_json, outfile):
             else:
                 rec["vals"].append([k[0], k[1], idx, all_])
         out["cv"][site] = rec
+    out["attr"] = {n: {o: list(encode(c)) for o, c in per.items()} for n, per in areads.items()}
     # tests that never completed under tracing: every value-based narrowing must keep them
     untraced = {i for t, i in pos.items() if t not in done}
     out["untraced"] = sorted(untraced)
