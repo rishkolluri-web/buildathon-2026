@@ -279,7 +279,8 @@ def pytest_sessionfinish(session, exitstatus):
 def apply_patch_text(src_root, patch):
     """Return (path, new_text) for our own single-file generated diffs."""
     path = re.search(r"^\+\+\+ b/(\S+)", patch, re.M).group(1)
-    old = (src_root / path).read_text().split("\n")
+    f = src_root / path
+    old = f.read_text().split("\n") if f.exists() else []  # new file
     sys.path.insert(0, str(REPO))
     import selector  # reuse the selector's hunk applier
 

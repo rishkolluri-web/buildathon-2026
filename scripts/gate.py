@@ -12,6 +12,7 @@ PASS only if ALL hold:
      (a narrowing nobody can check is not accepted)
 
   python3 scripts/gate.py            # defaults assume ../blast-radius-sample, ../sqlglot, ../stress
+  python3 scripts/gate.py --stress ../stress --stress ../stress_h3 --stress ../stress_x
 Exit code 0 = PASS, 1 = FAIL. Prints the measured numbers either way.
 """
 
@@ -57,7 +58,9 @@ def load_truth(stress, tests):
     if not base_f.exists():
         return truth
     base = set(json.loads(base_f.read_text()))
-    for f in sorted((stress / "truth").glob("m*.json")):
+    for f in sorted((stress / "truth").glob("*.json")):
+        if f.stem == "base":
+            continue
         s = set()
         for nid in set(json.loads(f.read_text())) - base:
             if nid.startswith("COLLECT::"):
@@ -80,7 +83,8 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--kit", default=str(REPO.parent / "blast-radius-sample"))
     ap.add_argument("--src", default=str(REPO.parent / "sqlglot"))
-    ap.add_argument("--stress", default=str(REPO.parent / "stress"))
+    ap.add_argument("--stress", action="append", default=None,
+                    help="mutation corpus dir (repeatable; default ../stress); mutant ids must be unique")
     ap.add_argument("--python", default=str(REPO.parent / ".venv313" / "bin" / "python"))
     ap.add_argument("--base", default="HEAD", help="git revision to beat")
     ap.add_argument("--json", help="write the measured numbers here")
@@ -89,15 +93,20 @@ def main():
                          "(all safety checks still apply)")
     a = ap.parse_args()
 
-    kit, stress = Path(a.kit).resolve(), Path(a.stress).resolve()
+    kit = Path(a.kit).resolve()
+    corpora = [Path(s).resolve() for s in (a.stress or [str(REPO.parent / "stress")])]
     tests = json.loads((kit / "sample" / "tests.json").read_text())["tests"]
     ms = {t["number"]: round(t["seconds"] * 1000) for t in tests}
     answers = {f"s:{k}": set(v["failing"]) for k, v in json.loads((kit / "sample" / "answers.json").read_text())["commits"].items()}
-    truth = {f"m:{k}": v for k, v in load_truth(stress, tests).items()}
+    truth = {f"m:{k}": v for c in corpora for k, v in load_truth(c, tests).items()}
 
     tmp = Path(tempfile.mkdtemp())
     mdata = tmp / "mdata"
-    shutil.copytree(stress / "commits", mdata / "commits")
+    (mdata / "commits").mkdir(parents=True)
+    for c in corpora:
+        for f in (c / "commits").glob("*.patch"):
+            assert not (mdata / "commits" / f.name).exists(), f"duplicate mutant id {f.name}"
+            shutil.copy(f, mdata / "commits" / f.name)
     shutil.copy(kit / "sample" / "tests.json", mdata / "tests.json")
     basedir = tmp / "base"
     basedir.mkdir()
