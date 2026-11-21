@@ -205,3 +205,22 @@ its swap rule and overstated the base cost).
 
 Sample went 170.3 -> 101.6 s (champion -> v9) but the hidden set only 179.5 -> 173.6 s simulated: the hidden
 set has few of the change kinds v8/v9 narrowed. CPU fell ~0.64 s on the server.
+
+### experiment/v10-fix (94c15ad068c87a2f62ea73ee671867ecba7f3d72) — validated, **NO-GO for submission**
+
+- Person 1's Window-kwarg counterexample reproduced (v10 5d62f7d selected 80 tests; local truth: 141 failing ids incl.
+  34 collection errors ≈ 1,020 tests). Cause: import-state subprocess ran without unittest/pytest loaded
+  (expressions/core.py UNITTEST). Fix: import unittest first; fail closed unless UNITTEST is True. Now: all tests.
+- stress_k miss iop-tokenizer_core-1029: cause = fingerprint truncation at depth 12 hid DuckDBGenerator.NORMAL_TEMPLATE.
+  Fix: no truncation (too deep -> error -> all tests). Now selected (no miss).
+- Strict gate vs ddd9678, sample + 15 corpora (incl. stress_k 36, stress_p 1, m030/m033 truth added): PASS,
+  0/30, 0/183 truth mutants, 58 unit tests, fill 0.0 s, all narrowed verified; total 2724.2 -> 1913.0 s.
+- CPU (scripts/bench.py, 3 runs): sample v9 0.190 s vs v10 0.196 s (0 patched imports; sim identical 101.552 s);
+  141 older mutants 2.82 -> 14.92 s (19 patched imports, ≈0.64 s each), sim 1301.6 -> 1216.7 s; stress_k 2.08 -> 26.95 s
+  (36 imports, ≈0.69 s each), sim 1039.2 -> 312.9 s. RSS 149 -> 184 MiB on mutants.
+  Projection (server ≈ 3–3.6× local CPU): older mutants net ≈ −41 to −49 s over 141 patches.
+- Docker (no-cache amd64, git archive 94c15ad): make sample 101.552 s, 0 misses; in-image m014/m016/window/
+  iop-1029/c2: 0 misses, but narrower only on 2 of 5 (sim 174.72 -> 156.0 s, ≈ +10 s server CPU projected); c2
+  narrows locally (6.7 s) but not in the image (27.45 s) — local-vs-image divergence unexplained.
+- Verdict: NO-GO. Sample unchanged; hidden-set gain not demonstrable; two real misses found in this rule family within
+  a day; image behaviour diverges from local evaluation. Champion stays ddd9678.
