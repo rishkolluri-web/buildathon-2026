@@ -45,6 +45,7 @@ class EdgeCases(unittest.TestCase):
         helper = read("sqlglot/helper.py")
         transpile = read("tests/test_transpile.py")
         helpers = read("tests/helpers.py")
+        errors = read("sqlglot/errors.py")
         cls.patches = {
             "synt": udiff("sqlglot/optimizer/scope.py", scope, scope.replace("def traverse_scope(", "def traverse_scope((", 1)),
             "cmnt": udiff("sqlglot/helper.py", helper, helper.replace("\ndef ", "\n# just a note\ndef ", 1)),
@@ -55,6 +56,7 @@ class EdgeCases(unittest.TestCase):
             "hlpr": udiff("tests/helpers.py", helpers, helpers.replace("def load_sql_fixtures(filename):\n", "def load_sql_fixtures(filename):\n    filename = filename.strip()\n", 1)),
             "mcon": udiff("sqlglot/helper.py", helper, helper.replace("\nlogger = ", "\nUNUSED_CONST = 3\nlogger = ", 1)),
             "rdme": udiff("README.md", "a\n", "b\n"),
+            "mrd": udiff("sqlglot/errors.py", errors, errors.replace("ERROR_MESSAGE_CONTEXT_DEFAULT = 100", "ERROR_MESSAGE_CONTEXT_DEFAULT = 101", 1)),
             "fxnw": udiff("tests/fixtures/optimizer/brand_new_case.sql", None, "SELECT 1;\nSELECT 1;\n"),
             "sqgc": udiff("sqlglotc/setup.py", "a = 1\n", "a = 2\n"),
             "conf": udiff("pyproject.toml", "a\n", "b\n"),
@@ -101,8 +103,15 @@ class EdgeCases(unittest.TestCase):
     def test_config_change_selects_everything(self):
         self.assertEqual(len(self.sel["conf"]), len(self.tests))
 
-    def test_module_level_constant_selects_everything(self):
-        self.assertEqual(len(self.sel["mcon"]), len(self.tests))
+    def test_new_unread_module_constant_selects_nothing(self):
+        # nothing can read a brand-new name, so it cannot change any test's behaviour
+        self.assertEqual(self.sel["mcon"], set())
+
+    def test_read_module_constant_selects_its_readers(self):
+        sel = self.sel["mrd"]
+        self.assertTrue(sel and len(sel) < len(self.tests), f"{len(sel)} selected")
+        # highlight_sql's default argument reads the constant; its callers must be selected
+        self.assertIn(self.num("tests/test_errors.py::TestErrors::test_highlight_sql_single_character"), sel)
 
     def test_comment_only_selects_nothing(self):
         self.assertEqual(self.sel["cmnt"], set())

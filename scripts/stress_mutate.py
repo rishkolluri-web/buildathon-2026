@@ -303,7 +303,10 @@ def run_truth(mid, a, src, out, plugin_dir):
             path, new = apply_patch_text(src, (out / "commits" / f"{mid}.patch").read_text())
             (work / path).write_text(new)
         env = dict(os.environ, SKIP_INTEGRATION="0", PYTHONPATH=f"{work}:{plugin_dir}", MUT_RESULT=str(res) + ".tmp",
-                   PATH=f"{Path(a.python).parent}:{os.environ['PATH']}", PYTHONDONTWRITEBYTECODE="1")
+                   PATH=f"{Path(a.python).parent}:{os.environ['PATH']}", PYTHONDONTWRITEBYTECODE="1",
+                   # tests spawn ProcessPoolExecutors sized to the CPU count; cap them so
+                   # parallel mutant runs don't oversubscribe the machine (parallelism only)
+                   PYTHON_CPU_COUNT=str(a.pool_cpus))
         p = subprocess.run([a.python, "-m", "pytest", "tests", "-p", "mut_fail_plugin", "-p", "no:cacheprovider",
                             "-n", str(a.workers), "--timeout", str(a.timeout), "-q"],
                            cwd=work, env=env, capture_output=True, text=True, timeout=1800)
@@ -324,6 +327,9 @@ def cmd_truth(a):
     plugin_dir.mkdir(exist_ok=True)
     (plugin_dir / "mut_fail_plugin.py").write_text(FAIL_PLUGIN)
     mids = ["base"] + sorted(json.loads((out / "meta.json").read_text()))
+    if a.first:  # run these first (e.g. the mutants a narrowing change must be safe on)
+        pri = [m for m in a.first.split(",") if m in mids]
+        mids = ["base"] + pri + [m for m in mids[1:] if m not in pri]
     with ThreadPoolExecutor(a.jobs) as ex:
         for mid, status in ex.map(lambda m: run_truth(m, a, src, out, plugin_dir), mids):
             print(mid, status, flush=True)
@@ -407,6 +413,8 @@ def main():
     t.add_argument("--jobs", type=int, default=2)
     t.add_argument("--workers", type=int, default=4)
     t.add_argument("--tmp", default=None)
+    t.add_argument("--pool-cpus", type=int, default=2)
+    t.add_argument("--first", default="", help="comma-separated mutant ids to run first")
     t.add_argument("--timeout", type=int, default=300, help="per-test pytest timeout; keep load low so only real hangs hit it")
     e = sub.add_parser("eval")
     e.add_argument("--src", required=True)

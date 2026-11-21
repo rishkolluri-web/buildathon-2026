@@ -34,6 +34,9 @@ WORKER_MS = 2000
 MAX_WORKERS = 8
 GLOBAL_CONFIG = {"pyproject.toml", "setup.cfg", "tox.ini", "pytest.ini", "conftest.py", "tests/conftest.py"}
 ALL = object()  # sentinel: select every test
+# Ablation switches for measuring each safety rule (never set in the image):
+# BR_OFF=imp,family,classhdr,fixdir,fill
+OFF = set(filter(None, os.environ.get("BR_OFF", "").split(",")))
 
 
 def log(*a):
@@ -54,6 +57,9 @@ class Map:
         self.touch = m["touch"]
         self.users = m.get("users", {})
         self.imp = {k: set(v) for k, v in m.get("imp", {}).items()}
+        self.refs = m.get("refs", {})
+        self.imports = m.get("imports", {})
+        self.star = m.get("star", {})
         # map bit positions -> tests.json numbers (by id, robust to reordering)
         num_by_id = {t["id"]: t["number"] for t in tests}
         self.bit_to_num = [num_by_id.get(tid) for tid in m["tests"]]
@@ -163,6 +169,14 @@ def first_line(node):
     return min([node.lineno] + [d.lineno for d in decs])
 
 
+def is_stub(fn):
+    return all(
+        isinstance(b, ast.Pass)
+        or (isinstance(b, ast.Expr) and isinstance(b.value, ast.Constant) and (b.value.value is Ellipsis or isinstance(b.value.value, str)))
+        for b in fn.body
+    )
+
+
 def is_docstring(node):
     return isinstance(node, ast.Expr) and isinstance(node.value, ast.Constant) and isinstance(node.value.value, str)
 
@@ -245,7 +259,7 @@ class Differ:
                     self.regions.append(("lines", span(o)))
                 self.regions.append(("class", ctx[1]))
             else:
-                self.regions.append(("module",))
+                self.regions.append(("module", list(removed), list(added)))
 
     def stmt_lines(self, s):
         return header_lines(s) if isinstance(s, COMPOUND) else span(s)
@@ -275,17 +289,17 @@ class Differ:
             # header changed
             if isinstance(o, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 self.regions.append(("lines", span(o)))
-                if ctx[0] == "class":
+                if ctx[0] == "class" and ("classhdr" not in OFF or o.name != n.name):
                     # decorators/defaults/name are evaluated at class creation
                     self.regions.append(("class", ctx[1]))
                 elif ctx[0] == "module" and o.name != n.name:
-                    self.regions.append(("module",))
+                    self.regions.append(("module", [o], [n]))
                 return
             if isinstance(o, ast.ClassDef):
                 qual = (ctx[1] + "." if ctx[0] == "class" and ctx[1] else "") + o.name
                 self.regions.append(("class", qual) if ctx[0] != "func" else ("lines", span(o)))
                 if o.name != n.name and ctx[0] == "module":
-                    self.regions.append(("module",))
+                    self.regions.append(("module", [o], [n]))
                 return
             if ctx[0] == "func":
                 self.regions.append(("lines", header_lines(o)))
@@ -301,15 +315,15 @@ class Differ:
             # lambda bodies run when called, never at import: plain coverage applies
             self.regions.append(("lambda", lam))
             return
-        self.unit_change(o, ctx)
+        self.unit_change(o, ctx, n)
 
-    def unit_change(self, o, ctx):
+    def unit_change(self, o, ctx, n=None):
         if ctx[0] == "class":
             self.regions.append(("class", ctx[1]))
         elif ctx[0] == "func":
             self.regions.append(("lines", span(o)))
         else:
-            self.regions.append(("module",))
+            self.regions.append(("module", [o], [n] if n is not None else None))
 
 
 def lambda_only_diff(o, n):
@@ -347,6 +361,27 @@ def lambda_only_diff(o, n):
 # ----------------------------------------------------------------------------- selection
 
 
+def bound_names(stmt):
+    out = set()
+    targets = []
+    if isinstance(stmt, ast.Assign):
+        targets = stmt.targets
+    elif isinstance(stmt, (ast.AnnAssign, ast.AugAssign)):
+        targets = [stmt.target]
+    elif isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+        out.add(stmt.name)
+    elif isinstance(stmt, (ast.Import, ast.ImportFrom)):
+        for a in stmt.names:
+            out.add((a.asname or a.name).split(".")[0])
+    for t in targets:
+        for n in ast.walk(t):
+            if isinstance(n, ast.Name):
+                out.add(n.id)
+            elif not isinstance(n, (ast.Tuple, ast.List, ast.Starred, ast.Load, ast.Store)):
+                out.add("__complex_target__")
+    return out
+
+
 def module_name(path):
     p = path[:-3].replace("/", ".")
     return p[: -len(".__init__")] if p.endswith(".__init__") else p
@@ -356,9 +391,104 @@ class Selector:
     def __init__(self, m: Map):
         self.m = m
 
+    MODULE_STMTS = (ast.Assign, ast.AnnAssign, ast.AugAssign, ast.Import, ast.ImportFrom,
+                    ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
+
+    def module_change(self, path, olds, news):
+        """Module-level statements changed in sqlglot/<path>. A module-level value can
+        only matter where its name is read: runtime readers' tests; import-time readers
+        resolved to class users / function callers / derived module names. Anything
+        not provably limited -> ALL."""
+        if "refs" in OFF or not self.m.refs or olds is None or news is None or not path.startswith("sqlglot/"):
+            log(f"  {path}: module-level change -> all tests")
+            return ALL
+        for st in olds + news:
+            if not isinstance(st, self.MODULE_STMTS):
+                log(f"  {path}: module-level {type(st).__name__} -> all tests")
+                return ALL
+        # a newly added/changed import may import a module for the first time
+        old_imps = {ast.dump(st) for st in olds if isinstance(st, (ast.Import, ast.ImportFrom))}
+        if any(isinstance(st, (ast.Import, ast.ImportFrom)) and ast.dump(st) not in old_imps for st in news):
+            log(f"  {path}: new/changed import -> all tests")
+            return ALL
+        names = set()
+        for st in olds + news:
+            names |= bound_names(st)
+        if not names or any(nm.startswith("__") for nm in names):
+            log(f"  {path}: module-level change binds {sorted(names)[:3]} -> all tests")
+            return ALL
+        return self.name_users(path, names)
+
+    def name_users(self, path, names, budget=40):
+        out = set()
+        seen = set()
+        work = [(path, nm, 0) for nm in names]
+        while work:
+            f, nm, depth = work.pop()
+            if (f, nm) in seen:
+                continue
+            seen.add((f, nm))
+            if len(seen) > budget or depth > 4:
+                log(f"  {path}: reference chain too long -> all tests")
+                return ALL
+            mod = module_name(f)
+            # files where `nm` (from f) is visible as a plain name, and its local alias
+            visible = [(f, nm)] + [tuple(x) for x in self.m.imports.get(f"{mod}:{nm}", [])]
+            visible += [(g, nm) for g in self.m.star.get(mod, [])]
+            entry_cache = {}
+            for g, local in visible:
+                if g != f:
+                    work.append((g, local, depth + 1))  # re-exports
+                e = entry_cache.setdefault(local, self.m.refs.get(local, {}))
+                idx = e.get("rtn", {}).get(g)
+                if idx is not None:
+                    out |= self.m.nums(self.m.set(idx))
+                for ctx in e.get("impn", []):
+                    if ctx[1] == g:
+                        r = self.import_ctx_users(ctx, depth, work)
+                        if r is ALL:
+                            log(f"  {path}: {nm} read at import in {g} -> all tests")
+                            return ALL
+                        out |= r
+            e = self.m.refs.get(nm, {})
+            for g, idx in e.get("rta", {}).items():  # x.NAME / getattr(x, "NAME")
+                out |= self.m.nums(self.m.set(idx))
+            for ctx in e.get("impa", []):
+                r = self.import_ctx_users(ctx, depth, work)
+                if r is ALL:
+                    log(f"  {path}: .{nm} read at import in {ctx[1]} -> all tests")
+                    return ALL
+                out |= r
+        return out
+
+    def import_ctx_users(self, ctx, depth, work):
+        kind, g = ctx[0], ctx[1]
+        if kind == "class":
+            idx = self.m.users.get(f"{module_name(g)}:{ctx[2]}")
+            users = self.m.nums(self.m.set(idx)) if idx is not None else set()
+            users |= self.family_users(g)
+            return users if users else ALL
+        if kind == "def":
+            _, _, qual, cls, b1, b2 = ctx
+            r = self.m.nums(self.lines_bits(g, range(b1, b2 + 1)))
+            if cls:
+                idx = self.m.users.get(f"{module_name(g)}:{cls}")
+                if idx is not None:
+                    r |= self.m.nums(self.m.set(idx))
+            return r
+        if kind == "module":
+            if not ctx[2]:
+                return ALL
+            for nm2 in ctx[2]:
+                work.append((g, nm2, depth + 1))
+            return set()
+        return ALL  # function body executed at import
+
     FAMILY_DIRS = ("dialects", "parsers", "generators", "tokenizers", "typing")
 
     def family_users(self, path):
+        if "family" in OFF:
+            return set()
         parts = path.split("/")
         if len(parts) != 3 or parts[0] != "sqlglot" or parts[1] not in self.FAMILY_DIRS:
             return set()
@@ -399,6 +529,19 @@ class Selector:
             log(f"  {path}: syntax error after patch -> import breaks")
             return ALL if not path.startswith("tests/test_") and not path.startswith("tests/dialects/test_") else self.file_tests(path)
         old_tree = ast.parse(old_text)
+        # def/class header lines (decorators, signature, defaults) execute at import to
+        # *create* the function/class; their effect shows up only through callers and
+        # class users, which the header-change rules already select. Only statements
+        # inside bodies that actually ran at import count as import-time changes.
+        imp_lines = self.m.imp.get(path, set()) if "imp" not in OFF else set()
+        if imp_lines:
+            headers = set()
+            for node in ast.walk(old_tree):
+                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                    headers |= header_lines(node)
+                    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and is_stub(node):
+                        headers |= span(node)  # `def f(...): ...` stubs: body does nothing
+            imp_lines = imp_lines - headers
         d = Differ(old_lines, new_lines, old_touched, new_touched)
         d.body(old_tree.body, new_tree.body, ("module", None), None)
         out = set()
@@ -410,10 +553,10 @@ class Selector:
             self.related |= self.family_users(path)
         for r in d.regions:
             if r[0] == "lines":
-                if not is_test_file and r[1] & self.m.imp.get(path, set()):
+                if not is_test_file and r[1] & imp_lines:
                     # runs while sqlglot is imported (metaclass, __init_subclass__,
                     # factories used in class bodies): every test inherits its effect
-                    log(f"  {path}: import-time line(s) {sorted(r[1] & self.m.imp[path])[:5]} -> all tests")
+                    log(f"  {path}: import-time line(s) {sorted(r[1] & imp_lines)[:5]} -> all tests")
                     return ALL
                 out |= self.m.nums(self.lines_bits(path, r[1]))
             elif r[0] == "lambda":
@@ -437,9 +580,11 @@ class Selector:
             else:  # module-level change
                 if path.startswith("tests/test_") or path.startswith("tests/dialects/test_"):
                     out |= self.file_tests(path)
-                else:
-                    log(f"  {path}: module-level change -> all tests")
+                    continue
+                r2 = self.module_change(path, r[1] if len(r) > 1 else None, r[2] if len(r) > 2 else None)
+                if r2 is ALL:
                     return ALL
+                out |= r2
         if d.regions and path in self.m.opens:  # tests that read this source file as data
             out |= self.m.nums(self.m.set(self.m.opens[path]))
         return out
@@ -485,7 +630,7 @@ class Selector:
                     if p and p in self.m.opens:
                         chosen |= self.m.nums(self.m.set(self.m.opens[p]))
                         hit = True
-                if not hit and path.startswith("tests/"):
+                if not hit and path.startswith("tests/") and "fixdir" not in OFF:
                     # data file no test opened at the pinned commit (new or listed by
                     # directory): take the readers of its sibling files
                     folder = path.rsplit("/", 1)[0] + "/"
@@ -564,7 +709,7 @@ def main():
         chosen = {n for n in chosen if n in ms}
         workers, cost = pack(chosen, ms)
         extra = 0
-        if sel and workers and len(chosen) < len(ms):
+        if sel and workers and len(chosen) < len(ms) and "fill" not in OFF:
             related = set(sel.related)
             for f in {sel_file[n] for n in chosen}:
                 related |= sel.m.by_file.get(f, set())

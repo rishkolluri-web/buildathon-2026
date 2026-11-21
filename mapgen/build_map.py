@@ -24,6 +24,7 @@ import glob
 import gzip
 import json
 import os
+import sys
 
 import coverage
 
@@ -46,6 +47,7 @@ def main():
     ap.add_argument("--opens", required=True)
     ap.add_argument("--tracks")
     ap.add_argument("--imports", help="json from import_lines.py")
+    ap.add_argument("--no-shared", action="store_true", help="ablation: credit setup/collection only to the test whose phase ran it")
     ap.add_argument("--tests", required=True)
     ap.add_argument("--root", required=True)
     ap.add_argument("--out", required=True)
@@ -67,6 +69,8 @@ def main():
         work affect every test of that file, so credit them to the whole file."""
         b = 0
         for n in nodeids:
+            if args.no_shared:
+                n = "" if n.startswith("collect:") else n.partition("|")[0]
             if n.startswith("collect:"):
                 b |= file_bits.get(n[len("collect:"):], 0)
                 continue
@@ -129,6 +133,34 @@ def main():
         for cid in sorted(set(mro) | set(users)):
             users_out[cid] = table.add(users.get(cid, 0))
 
+    imports_json = json.load(open(args.imports)) if args.imports else {}
+    refs_out, imports_out, star_out = {}, {}, {}
+    if args.imports:
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        import refs_index
+
+        idx = refs_index.build(root.rstrip(os.sep), imports_json)
+        for kind in ("n", "a"):
+            for name in set(idx.rt[kind]) | set(idx.imp[kind]):
+                entry = refs_out.setdefault(name, {})
+                rt = {}
+                for rel, lines in idx.rt[kind].get(name, {}).items():
+                    per = lines_out.get(rel, {})
+                    b = 0
+                    for ln in lines:
+                        i = per.get(str(ln))
+                        if i is not None:
+                            b |= table.sets[i]
+                    if b:
+                        rt[rel] = table.add(b)
+                if rt:
+                    entry["rt" + kind] = rt
+                if name in idx.imp[kind]:
+                    entry["imp" + kind] = idx.imp[kind][name]
+        refs_out = {k: v for k, v in refs_out.items() if v}
+        imports_out = idx.imports
+        star_out = idx.star
+
     out = {
         "tests": test_ids,
         "sets": [format(b, "x") for b in table.sets],
@@ -136,7 +168,10 @@ def main():
         "opens": opens_out,
         "touch": touch_out,
         "users": users_out,
-        "imp": json.load(open(args.imports)) if args.imports else {},
+        "imp": imports_json,
+        "refs": refs_out,
+        "imports": imports_out,
+        "star": star_out,
     }
     with gzip.open(args.out, "wt", encoding="utf-8", compresslevel=9) as f:
         json.dump(out, f, separators=(",", ":"))
