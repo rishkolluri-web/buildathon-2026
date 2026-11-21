@@ -423,7 +423,34 @@ class Selector:
         if not names or any(nm.startswith("__") for nm in names):
             log(f"  {path}: module-level change binds {sorted(names)[:3]} -> all tests")
             return ALL
-        return self.name_users(path, names)
+        # FIX r3: a star import binds names no static reader can be matched to; adding or
+        # removing one changes what the module (and everything re-exporting it) provides.
+        if "*" in names:
+            log(f"  {path}: star import added/removed -> all tests")
+            return ALL
+        out = self.name_users(path, names)
+        if out is ALL:
+            return ALL
+        # FIX r2: a class that did not exist before can be picked up without being named:
+        # subclass scans (helper.subclasses / inspect.getmembers), metaclass registries and
+        # __init_subclass__ hooks. Select the users of its base classes.
+        old_classes = {st.name for st in olds if isinstance(st, ast.ClassDef)}
+        for st in news:
+            if isinstance(st, ast.ClassDef) and st.name not in old_classes:
+                bases = {b.id if isinstance(b, ast.Name) else b.attr for b in st.bases
+                         if isinstance(b, (ast.Name, ast.Attribute))}
+                if not bases:
+                    continue  # plain `class X:` has no registry to join
+                hit = False
+                for cid, idx in self.m.users.items():
+                    if cid.rsplit(":", 1)[-1].rsplit(".", 1)[-1] in bases:
+                        out |= self.m.nums(self.m.set(idx))
+                        hit = True
+                if not hit:
+                    log(f"  {path}: new class {st.name} with unknown bases -> all tests")
+                    return ALL
+                log(f"  {path}: new class {st.name} -> users of {sorted(bases)}")
+        return out
 
     def name_users(self, path, names, budget=40):
         out = set()
