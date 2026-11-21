@@ -195,3 +195,13 @@ its swap rule and overstated the base cost).
 - Docker (no-cache amd64 build of `git archive ddd9678`, make sample): 101.552 s, 0 misses; static index built in image.
 - CPU (loaded machine, 5 runs, same conditions): sample 8238fd6 0.957 / 5bf7a1e 1.214 / ddd9678 0.428 s;
   141 mutants 11.9 / 30.5 / 6.3 s. RSS sample 113.6 -> 92.5 MiB.
+
+### Official BB-ABA7AA09 (ddd9678, experiment/perf-v9): 174.5 s, 0 misses — new champion
+
+| Submission | SHA | Score | Simulated | CPU | Missed |
+|---|---|---|---|---|---|
+| BB-ABA7AA09 | ddd9678c2a16fb0a5013829b2803eac40bbacf05 | **174.5 s** | 173.564 s | ~0.94 s | 0 |
+| BB-CD8DBEBB | 8238fd692c02fc764e953ae4a15706a64e6c01d8 | 181.1 s | 179.522 s | ~1.58 s | 0 |
+
+Sample went 170.3 -> 101.6 s (champion -> v9) but the hidden set only 179.5 -> 173.6 s simulated: the hidden
+set has few of the change kinds v8/v9 narrowed. CPU fell ~0.64 s on the server.
