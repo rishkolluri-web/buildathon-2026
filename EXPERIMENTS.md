@@ -43,3 +43,20 @@ Baseline c003640 on 77 mutants: 785.7 s, 8 all-test escalations = 294.5 s (37 %)
 | 3 | Class data: readers-only (union of runtime attribute readers, no ∩ with instantiating users: covers class-object reads like `dialect.parser_class.X`); enum-like classes fall back to users+family; new non-test module -> tests that enumerate packages (iter_modules/walk_packages/listdir/glob…); any conftest.py or new tests/**/__init__.py -> all | PASS (22 truth) | 178.7→170.4 | 785.7→779.4 | −14.7 s | vs iter 1: m:m034 2.04→2.72; x_t11_035 (Drill ARRAY_SIZE_NAME) 12→38 tests (c003640: 767). Targeted truth (../stress_h3 t1–t6) in progress: t1/t2 done, t3–t6 pending; x_t11_035 full-suite truth queued. CPU sample 0.212→0.231 s, mutants 0.708→0.773 s (local) |
 
 PR #2 (Person 1, tests/test_selector_risks.py, 5 failure-based regression tests) merged at 5c6dbf5: 5/5 pass on c003640, perf-v5 and iter 3; unittest 39 OK (1 skipped); sample unchanged 170.349 s, 0 misses. Packing: pack() equals the LPT lower bound on every patch (949.051 s = LB), no packing change possible.
+
+### perf-v5 validation (b702e01, 2026-11-20)
+
+Targeted full-suite ground truth (../stress_h3, disposable copies, 2 jobs x 4 xdist workers, pools capped at 2 CPUs, 900 s per-test timeout; baseline failures = 3 test_sqlglotc obsolete-extension tests, subtracted; every new failure maps to a tests.json id):
+
+| Mutant | Failing | c003640 | 6b41c7e (H3 ∩ users) | b702e01 |
+|---|---|---|---|---|
+| t1 new module in sqlglot/typing/ | 1 (test_typing, #1619) | **MISS** (0 selected) | **MISS** | caught (1) |
+| t2 new unreferenced module | 0 | 0 | 0 | 1 |
+| t3 class attr read via class object | 2 | 1543 | 39 | 39 |
+| t4 enum member -> alias | 64 | 1485 | 1485 | 1485 |
+| t5 inherited dict entry | 2 | see gate | | 0 missed |
+| t6 class-level set entry removed | 0 | | | 0 missed |
+
+Gate vs c003640 with --stress ../stress --stress ../stress_h3: PASS, 0/30 sample, 0/28 mutants missed, total 1083.8 -> 994.5 s (-89.3 s). x_t11_035 (Drill ARRAY_SIZE_NAME; c003640 767 tests, 6b41c7e 12, b702e01 38) full-suite truth with a fresh baseline: running.
+
+test_execute_tpcds (21.454 s) review: selected through coverage of the changed lines (2haz 2jrq 3utz 66ks, m003 m005 m009 m019 m026 m037 m054 m056), module-name readers (m038 m041), duckdb family (m049), file users (t4), or all-tests escalations. It fails in 4/6 coverage-selected cases with truth (2jrq 3utz m003 m005). The two non-failing sample cases (2haz 66ks, `is` -> `==`) are equivalent only given runtime types without __eq__ overrides, not provable from the source -> kept. Packing: 114 patches, pack 1002.112 s vs lower bound 1002.111 s -> no packing gain.
