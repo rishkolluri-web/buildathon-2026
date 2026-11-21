@@ -287,3 +287,19 @@ Diagnosis: 3 official submissions at exactly 174.5 s while the sample improved. 
   (each -> 36.817 s); the other 410 patches (incl. the whole sample) are byte-identical.
 - CPU with each revision's own static index (as in the image; 7 interleaved runs): v16 0.228 s, v17 0.231 s; outputs
   identical. Without an index (bench.py's mode) v17 is 1.27 s vs 0.43 s (lazy class-attribute scan): image-irrelevant.
+- Docker (no-cache amd64, `git archive ecf5f82`, kit make -o build sample): 101.368 s, 0 misses; static index built in
+  the image (incl. `_shared_mut`); image run with the kit RUN_FLAGS on ../stress_sa and ../stress_sm byte-identical to local.
+
+### Speed study after v17 (no rule kept)
+
+- Uniform single-token site census (scripts/site_census.py: every is/==, ==/!=, </<=, and/or, dropped not, int ±1,
+  True/False site in sqlglot/*.py = 13,753 sites; random 1,500, seed 20261121; v17 + its static index):
+  mean 8.69 s/site (sample 3.4 s/commit, so the hidden generator is not uniform). 322 sites >= 25 s: 229 plain line
+  coverage (optimizer 123, parser 70), 84 import-time iso, 9 other. Cost floors: test_execute_tpcds alone 25.45 s on
+  166 sites; test_max_nodes in only 66 of 1,500 (36.82 s on 63).
+- Only and/or swaps can be proved result-preserving by a value trace (dropped `not`, bool and int constants always
+  change the value; tpcds exclusion would need output-equivalence proof). Prototype truthiness trace of every 2-operand
+  and/or in sqlglot function bodies, each slow test run alone (pool children included, all 5 pass under the rewrite):
+  of 87 census and/or sites >= 25 s, tpcds saw only result-preserving combinations at 13, test_max_nodes at 4.
+  Expected hidden gain ~1-2 s per submission (and/or ~15 % of sites x 15 % droppable x ~20 s x ~2 costly commits):
+  negligible against a vtrace rebuild + truth corpus + gate. Not implemented.
