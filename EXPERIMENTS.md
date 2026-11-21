@@ -181,3 +181,19 @@ Equivalence evidence: scripts/diff_swap.py over EVERY single-op is/==/is not/!= 
 Unit test: build-time index == lazy == corrupt-index output on every edge-case patch.
 gate.py fix: the base revision now also gets its eqsites.json (before, gating against v8 ran v8 without
 its swap rule and overstated the base cost).
+
+### Official BB-D230C8FC (01f0536, v12): 174.5 s, 0 misses (identical to the previous champion)
+
+### experiment/attr-read-v13 (4bde6ef10696a6cc7269cc8961949ce0f7bf28b7, base 01f0536)
+
+- Traced attribute reads (owner-resolved) replace line-coverage readers in class_data_readers.
+- Setting-flip corpus (all 803 one-line boolean UPPER class settings, projection): 6968.0 -> 5771.8 s (−1196.2 s),
+  498 improved, 0 slower. Ground truth on 40 of them (../stress_ar: 22 largest savings, 13 random, 5 unchanged
+  controls): 0 missed; projected 709.3 -> 202.9 s on those 40.
+- Dialect.SAFE_TO_ELIMINATE_DOUBLE_NEGATION flip (the audit's f08 type): NOT improved (25.454 s) — the trace shows
+  test_execute_tpcds genuinely evaluates the setting (owner Dialect, 7 readers).
+- Gate vs 01f0536, sample + 18 corpora: PASS, 0/30, 0/259 truth, unit tests OK; total 3923.1 -> 3391.6 s.
+  Sample 101.552 -> 101.368 s (535z narrowed, its failing test kept); 141 older mutants 1301.6 -> 1276.7 s (14 improved,
+  0 slower); v12 comparison-constant corpus unchanged (456.5 s).
+- CPU (bench, 3 runs): sample 0.395 -> 0.425 s; 141 mutants 3.253 -> 3.591 s. vmap 160 -> 234 KB.
+- Docker (no-cache amd64, git archive 4bde6ef): make sample 101.368 s, 0 misses; image == local on all 40 flip mutants.
