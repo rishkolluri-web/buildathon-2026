@@ -84,6 +84,10 @@ class EdgeCases(unittest.TestCase):
                             read("sqlglot/tokenizer_core.py").replace('if char == "\\n" or char == "\\r":', "if char == 'Y' or char == \"\\r\":", 1)),
             "hvkeep": udiff("sqlglot/parser.py", read("sqlglot/parser.py"),
                             read("sqlglot/parser.py").replace("        n = len(parts)\n\n        if n == 1:\n", "        n = len(parts)\n\n        if n == 0:\n", 1)),
+            # dialect re-registration after TestDialectEntryPoints clears Dialect._classes (stress_ord o2,
+            # full-suite truth: 28 failing, incl. tests that only reach these lines after that reset)
+            "ordreg": udiff("sqlglot/dialects/dialect.py", read("sqlglot/dialects/dialect.py"),
+                            read("sqlglot/dialects/dialect.py").replace("and attr.__name__.lower() == key", "and attr.__name__.lower() != key", 1)),
             "cmnt": udiff("sqlglot/helper.py", helper, helper.replace("\ndef ", "\n# just a note\ndef ", 1)),
             "newf": udiff("sqlglot/brand_new.py", None, "X = 1\n"),
             "ndia": udiff("sqlglot/dialects/myqsl.py", None,
@@ -258,6 +262,14 @@ class EdgeCases(unittest.TestCase):
         # a test with no isolated run (fails alone) is always selected
         self.assertIn(self.num("tests/dialects/test_dialect.py::TestDialect::test_lazy_load"), sel)
         self.assertLess(len(sel), len(self.tests))
+
+    def test_order_dependent_reregistration_uses_post_reset_coverage(self):
+        # coverage of these lines depends on which tests follow the registry reset in a worker;
+        # the post-reset pass (mapgen/reset_plugin.py) credits every test that re-resolves a dialect
+        for t in ("tests/test_diff.py::TestDiff::test_dialect_aware_diff",
+                  "tests/test_expressions.py::TestExprs::test_sql",
+                  "tests/test_optimizer.py::TestOptimizer::test_eliminate_joins"):
+            self.assertIn(self.num(t), self.sel["ordreg"])
 
     def test_heavy_value_rule_drops_only_unaffected_slow_tests(self):
         mx = self.num("tests/test_parser.py::TestParser::test_max_nodes")
