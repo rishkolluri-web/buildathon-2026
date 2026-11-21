@@ -197,3 +197,22 @@ its swap rule and overstated the base cost).
   0 slower); v12 comparison-constant corpus unchanged (456.5 s).
 - CPU (bench, 3 runs): sample 0.395 -> 0.425 s; 141 mutants 3.253 -> 3.591 s. vmap 160 -> 234 KB.
 - Docker (no-cache amd64, git archive 4bde6ef): make sample 101.368 s, 0 misses; image == local on all 40 flip mutants.
+
+### experiment/heavy-all-v14 (base 4bde6ef = v13): trimmed ALL fallbacks — code 91c5abd
+
+Diagnosis: 3 official submissions at exactly 174.5 s while the sample improved. The sample has 0 ALL commits; the hidden set costs ≈72 s more ≈ 2 × 36.82 s (cost of an ALL selection, floored by test_max_nodes 28.8 s + 4 workers).
+- ALL census (`scripts/all_census.py`, 338 local patches on v13): 33 ALL patches. 28 are import-time lines, mostly in core modules (parser, tokenizer_core, expressions/core, dialects/dialect), which every test imports.
+- Heavy closures (`mapgen/heavy_closure.py` → heavy.json): each test > 3 s runs alone and the sqlglot modules it imports are recorded. Counts: test_max_nodes 37/185 modules, tpcds 90, tpch 67, optimized_tpch 71, generator_memory 151.
+  - A parent-process-only first attempt was wrong. It missed tpcds's spawned pool children importing parsers/mysql.py, so on m068 it would have dropped tpcds, which really fails.
+  - With children recorded: 0 violations over the 32 heavy-test failures in 258 earlier truth runs.
+- Rule: an ALL from in-place edits of sqlglot modules → every test minus the slow tests whose closure contains none of the changed modules. Fail-closed (plain ALL) when:
+  - the import-time code (old or new) mutates shared state, or defines a class that could replace a registered dialect;
+  - the change is a rename, delete, new file, config file or test file;
+  - heavy.json is missing.
+- Validation corpora with full-suite truth: ../stress_hv (32 syntax errors in non-core modules) and ../stress_hv2 (7 import-time edits; `scripts/all_mutations.py`). Heavy tests fail 31 times there and all 31 are selected.
+- Gate vs 4bde6ef (all 19 corpora): PASS. 0/30 sample, 0/298 truth mutants. Total 4827.5 → 4279.2 s (−548.3 s). Fill 0.0 s. Unit tests OK, including 4 new regression tests (m068-like mysql syntax error keeps tpcds, spark2 import-time line, foreign-mutation and dialect-name fail-closed cases).
+- Per trimmed patch: 36.82 → 19.08 s when tpcds is also exempt; 36.82 → ≈28.3 s when tpcds is kept.
+- CPU on the sample (bench, 5 runs × 2 interleaved, idle): 0.423/0.424 s (4bde6ef) vs 0.423/0.428 s.
+- Docker (no-cache amd64, `git archive 91c5abd`, kit make sample): 101.368 s, 0 misses.
+  - Image on the 43 trimmable patches (as nobody, read-only, no network): byte-identical to local output, all 43 trimmed.
+- Expected official effect: only on hidden ALL commits that edit non-core modules (dialect, parser, generator or optimizer files). Core-module ALL commits are unchanged.
