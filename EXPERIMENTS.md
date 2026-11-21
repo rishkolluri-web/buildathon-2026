@@ -155,3 +155,29 @@ Sample: 2haz 25.45 -> 0 s, 66ks 24.79 -> 0 s (both 0 failing in answers). Corpor
 - Gate vs champion 8238fd6, sample + 10 corpora: PASS, 0/30, 0/89 truth mutants, fill 0.0 s, all narrowed patches verified; total 2038.0 -> 1430.8 s (-607.2 s, mostly the swap corpora). Unit tests 49 OK.
 - Docker (exact 5bf7a1e, no-cache amd64, make sample): 120.108 s, 0 misses (champion 170.349 s); eqsites.json in /app, mode 644; protocol OK.
 - CPU: sample 0.434 -> 0.558 s; 77 non-swap patches 0.961 -> 0.957 s; each real swap patch ~+0.27 s (AST compare of large files).
+
+## experiment/perf-v9 (base: typecheck-v8 candidate 5bf7a1e, code-identical to e790318)
+
+Bench: `scripts/bench.py` (fresh process per run = cold start, revisions interleaved, user+sys CPU of
+the selector process via wait4, max RSS). "mut" = all 141 corpus mutants in one data dir.
+Profile of 5bf7a1e on mut (cProfile, 42.7 s inflated): swap_only_sites 81 % (deepcopy + normalise +
+ast.dump of both whole trees on every patch passing the is/== prefilter: 30/141), Differ.key ast.dump
+2.1 s, enum_like_classes 1.5 s, family_users/import_uses 0.9 s, family_dependents 0.11 s; map load 33 ms.
+
+### Track B (selector CPU; selections byte-identical to 5bf7a1e on sample + 141 mutants)
+
+| Step | Change | Sample CPU (median, 5–7 runs) | Mutants CPU | Peak RSS (sample / mut) | Kept |
+|---|---|---|---|---|---|
+| 0 | 5bf7a1e (v8) | 0.577 s (sd 0.001) | 13.81 s | 112.5 / 196.9 MiB | — |
+| 1 | swap_only_sites: copy-free parallel walk, untouched statements skipped (e1ded18) | 0.442 s | 3.69 s | 109.4 / 144.3 MiB | yes |
+| 2 | enum_like_classes lazily, auto() scan once per class (e1ded18) | 0.431 s | 3.53 s | 109.4 / 147.1 MiB | yes |
+| 3 | build-time static index of pinned-source analyses (4498636; /app/static_index.pkl via `--build-index`) | 0.224 s | 3.23 s | 89.6 / 146.1 MiB | yes |
+| 4 | hash-consed AST fingerprint for Differ.key | 0.202 s | 3.45 s (+7 %) | — | **rejected** (no sample gain alone, mutants slower) |
+| 5 | header-line walk only when a region hits import-time lines (370184c) | 0.203 s | 3.07 s | 89.7 / 146.0 MiB | yes |
+
+Equivalence evidence: scripts/diff_swap.py over EVERY single-op is/==/is not/!= site in pinned sqlglot
+(9106 synthetic patches: swap, wrong-negation, ==→<=, swap+edit, swap+swap, swap+whitespace):
+0 mismatches between the old and new swap classification (4962 swap-only by both).
+Unit test: build-time index == lazy == corrupt-index output on every edge-case patch.
+gate.py fix: the base revision now also gets its eqsites.json (before, gating against v8 ran v8 without
+its swap rule and overstated the base cost).

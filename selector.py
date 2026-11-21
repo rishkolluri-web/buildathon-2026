@@ -34,6 +34,9 @@ EQ = Path(os.environ.get("BR_EQ", HERE / "eqsites.json"))
 # names), written at image build time by `selector.py --build-index` from the same BR_SRC.
 # Missing or unreadable -> computed lazily at runtime exactly as before.
 IDX = Path(os.environ.get("BR_IDX", HERE / "static_index.pkl"))
+# Per-test value trace of the pinned suite (mapgen/vtrace.py): class-dict entry reads and
+# relational comparison outcomes.
+VMAP = Path(os.environ.get("BR_VMAP", HERE / "vmap.json.gz"))
 
 WORKER_MS = 2000
 MAX_WORKERS = 8
@@ -66,7 +69,7 @@ class Map:
         self.imports = m.get("imports", {})
         self.star = m.get("star", {})
         # map bit positions -> tests.json numbers (by id, robust to reordering)
-        num_by_id = {t["id"]: t["number"] for t in tests}
+        num_by_id = self.num_by_id = {t["id"]: t["number"] for t in tests}
         self.bit_to_num = [num_by_id.get(tid) for tid in m["tests"]]
         self.by_file = {}
         for t in tests:
@@ -364,7 +367,8 @@ class Differ:
 
     def unit_change(self, o, ctx, n=None):
         if ctx[0] == "class":
-            self.regions.append(("class", ctx[1], [o, n] if n is not None else None))
+            # 4th element marks a true old/new statement pair (not removed+added lists)
+            self.regions.append(("class", ctx[1], [o, n] if n is not None else None, "pair" if n is not None else None))
         elif ctx[0] == "func":
             self.regions.append(("lines", span(o)))
         else:
@@ -425,6 +429,14 @@ def bound_names(stmt):
             elif not isinstance(n, (ast.Tuple, ast.List, ast.Starred, ast.Load, ast.Store)):
                 out.add("__complex_target__")
     return out
+
+
+def name_of(st):
+    """The single name a module-level def/class/simple assignment binds, else None."""
+    if isinstance(st, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+        return st.name
+    b = bound_names(st) if isinstance(st, (ast.Assign, ast.AnnAssign)) else set()
+    return next(iter(b)) if len(b) == 1 else None
 
 
 def module_name(path):
@@ -491,6 +503,134 @@ def swap_only_sites(old_tree, new_tree, touched=None):
     return sites or None
 
 
+_OP_NORM = re.compile(r"\bis\s+not\b|\bis\b|<=|>=|==|!=|<|>")
+_REL_OPS = (ast.Lt, ast.LtE, ast.Gt, ast.GtE)
+_CMP_OPS = {ast.Lt: "Lt", ast.LtE: "LtE", ast.Gt: "Gt", ast.GtE: "GtE", ast.Eq: "Eq", ast.NotEq: "NotEq"}
+
+
+def op_only_hunks(hunks):
+    """Cheap prefilter: every hunk removes as many lines as it adds and each removed line pairs
+    with an added line that differs only in comparison operators (the AST check is the real test)."""
+    for _, lines in hunks:
+        rem = [t for tag, t in lines if tag == "-"]
+        add = [t for tag, t in lines if tag == "+"]
+        if not rem or len(rem) != len(add) or any(_OP_NORM.sub("@", x) != _OP_NORM.sub("@", y) for x, y in zip(rem, add)):
+            return False
+    return True
+
+
+def op_change_sites(old_tree, new_tree, touched):
+    """[("line:col", old op type, new op type)] of single-operator comparisons whose operator
+    differs, if that is the ONLY difference between the trees; else None. Same parallel walk
+    and untouched-statement skip as swap_only_sites (requires op_only_hunks)."""
+    sites = []
+
+    def same(a, b):
+        if type(a) is not type(b):
+            return False
+        if isinstance(a, ast.AST):
+            if isinstance(a, ast.stmt):
+                s = first_line(a)
+                if (s == first_line(b) and a.end_lineno == b.end_lineno and a.col_offset == b.col_offset
+                        and a.end_col_offset == b.end_col_offset
+                        and not any(s <= ln <= a.end_lineno for ln in touched)):
+                    return True
+            if isinstance(a, ast.Compare):
+                ta, tb = [type(o) for o in a.ops], [type(o) for o in b.ops]
+                if ta != tb:
+                    if len(ta) != 1 or len(tb) != 1:
+                        return False
+                    sites.append((f"{a.lineno}:{a.col_offset}", ta[0], tb[0]))
+                return same(a.left, b.left) and same(a.comparators, b.comparators)
+            for f in a._fields:
+                if not same(getattr(a, f, None), getattr(b, f, None)):
+                    return False
+            return True
+        if isinstance(a, list):
+            return len(a) == len(b) and all(same(x, y) for x, y in zip(a, b))
+        return a == b
+
+    if not same(old_tree, new_tree):
+        return None
+    return sites or None
+
+
+# expression nodes whose evaluation cannot raise or run code when only Constant leaves change
+_INERT_PARENTS = (ast.Tuple, ast.List, ast.Set, ast.Dict)
+_ACTIVE = (ast.Call, ast.Await, ast.Yield, ast.YieldFrom, ast.NamedExpr, ast.ListComp, ast.SetComp,
+           ast.DictComp, ast.GeneratorExp, ast.Starred)
+
+
+_INERT_ARGS = (ast.Constant, ast.Name, ast.Attribute, ast.Tuple, ast.List, ast.Set, ast.Dict, ast.Load)
+
+
+def is_closure_factory(fn, lazy_annotations=False):
+    """def f(...): [docstring] def g(...): ...  return g   (or: return lambda ...: ...)
+    Calling it binds the arguments and returns a new function; nothing else runs and nothing can
+    raise (inner defs/lambdas without defaults or decorators: no expression is evaluated;
+    annotations only under `from __future__ import annotations`, which never evaluates them)."""
+    body = [b for b in fn.body if not is_docstring(b)]
+    if not body or not isinstance(body[-1], ast.Return) or fn.decorator_list:
+        return False
+    ret = body[-1].value
+    if isinstance(ret, ast.Lambda):
+        return len(body) == 1 and not ret.args.defaults and not any(ret.args.kw_defaults)
+    inner = body[:-1]
+    return (bool(inner) and isinstance(ret, ast.Name)
+            and all(isinstance(d, ast.FunctionDef) and not d.decorator_list and not d.args.defaults
+                    and not any(d.args.kw_defaults) and (lazy_annotations or (not d.returns and not any(
+                        a.annotation for a in d.args.args + d.args.kwonlyargs + d.args.posonlyargs
+                        + [x for x in (d.args.vararg, d.args.kwarg) if x])))
+                    for d in inner)
+            and ret.id in {d.name for d in inner})
+
+
+def const_leaf_diff(a, b, factory=lambda name: False):
+    """True if a and b (class-body entry values) differ only in Constant leaves that sit directly
+    in a tuple/list/set/dict display, are the value itself, are a numeric operand of unary -/+, are
+    an argument of a call to a closure factory (`factory(name)`; arguments plain constants, names,
+    attributes or displays), or sit anywhere inside a lambda body (runs only when called); and
+    neither value contains other code that runs at class creation (calls, comprehensions...)."""
+    for v in (a, b):
+        stack = [v]
+        while stack:
+            n = stack.pop()
+            if isinstance(n, ast.Lambda):
+                stack.append(n.args)  # defaults are evaluated at class creation; only the body waits
+                continue
+            if isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and factory(n.func.id) and all(
+                    isinstance(x, _INERT_ARGS) for arg in n.args + [k.value for k in n.keywords] for x in ast.walk(arg)):
+                continue  # bound into a closure; runs only when a test calls the entry
+            if isinstance(n, _ACTIVE):
+                return False
+            stack.extend(ast.iter_child_nodes(n))
+
+    def walk(x, y, parent, in_lambda):
+        if type(x) is not type(y):
+            return False
+        if isinstance(x, ast.Constant):
+            if x.value == y.value and type(x.value) is type(y.value):
+                return True
+            if in_lambda or parent is None or isinstance(parent, _INERT_PARENTS + (ast.keyword,)):
+                return True
+            if isinstance(parent, ast.Call) and x is not parent.func:
+                return True  # argument of an accepted closure-factory call (checked above)
+            if isinstance(parent, ast.UnaryOp) and isinstance(parent.op, (ast.USub, ast.UAdd)):
+                num = (int, float, complex)
+                return isinstance(x.value, num) and isinstance(y.value, num) \
+                    and not isinstance(x.value, bool) and not isinstance(y.value, bool)
+            return False
+        if isinstance(x, ast.Lambda):  # body runs only when called; defaults run now
+            return walk(x.args, y.args, x, in_lambda) and walk(x.body, y.body, x, True)
+        if isinstance(x, ast.AST):
+            return all(walk(getattr(x, f, None), getattr(y, f, None), x, in_lambda) for f in x._fields)
+        if isinstance(x, list):
+            return len(x) == len(y) and all(walk(p, q, parent, in_lambda) for p, q in zip(x, y))
+        return x == y
+
+    return walk(a, b, None, False)
+
+
 class Selector:
     def __init__(self, m: Map):
         self.m = m
@@ -501,6 +641,146 @@ class Selector:
             self.eq_safe = set()
         if not OFF:  # ablation switches change import_uses/family results: never use the index then
             self.load_static_index()
+        self._vmap = None
+
+    def vmap(self):
+        """Per-test value trace (mapgen/vtrace.py), loaded on first use; False if unavailable."""
+        if self._vmap is None:
+            self._vmap = False
+            if "vtrace" not in OFF:
+                try:
+                    with gzip.open(VMAP, "rt", encoding="utf-8") as f:
+                        v = json.load(f)
+                    v["bit_to_num"] = [self.m.num_by_id.get(t) for t in v["tests"]]
+                    v["seen"] = set(v["cmp_seen"])
+                    self._vmap = v
+                except Exception as e:  # noqa: BLE001 - no trace: the rules below just don't apply
+                    log(f"value trace unavailable ({e!r})")
+        return self._vmap
+
+    def vnums(self, v, idx):
+        out, bits, i = set(), int(v["sets"][idx], 16), 0
+        b2n = v["bit_to_num"]
+        while bits:
+            if bits & 1 and b2n[i] is not None:
+                out.add(b2n[i])
+            bits >>= 1
+            i += 1
+        return out
+
+    def op_change(self, path, old_tree, new_tree, touched):
+        """Only comparison operators changed in this file: tests whose traced comparisons at the
+        changed sites would have returned a different result (exactly those can run differently).
+        None -> rule not applicable (normal selection)."""
+        diffs = op_change_sites(old_tree, new_tree, touched)
+        if not diffs:
+            return None
+        v = self.vmap()
+        if not v:
+            return None
+        out = set()
+        for site, a, b in diffs:
+            key = f"{path}:{site}"
+            if {a, b} in _SWAPS:
+                if self.sole and key in self.eq_safe:
+                    continue  # the v8 rule's own conditions, unchanged
+                return None
+            if a not in _REL_OPS or b not in _CMP_OPS or key not in v["seen"]:
+                return None  # operator kind not traced, or site never executed in the trace
+            e = v["cmp"].get(key)
+            alt = _CMP_OPS[b]
+            if e is None or alt in e["all"]:
+                return None  # differing result outside any test (import/session/subprocess)
+            if alt in e["r"]:
+                out |= self.vnums(v, e["r"][alt])
+        log(f"  {path}: comparison operator change(s) {[(s, a.__name__, b.__name__) for s, a, b in diffs]} "
+            f"-> {len(out)} tests with a differing result")
+        return out
+
+    def closure_factory(self, path, name):
+        """Is `name`, as bound at module level in pinned `path` (defined there or imported with
+        `from sqlglot... import name`), a closure factory (is_closure_factory)?"""
+        cache = self.__dict__.setdefault("_factory", {})
+        key = (path, name)
+        if key not in cache:
+            cache[key] = False
+            tree = self.pinned_tree(path)
+            target = None
+            for st in tree.body if tree else ():
+                if isinstance(st, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Assign, ast.AnnAssign)) \
+                        and name in bound_names(st):
+                    target = (path, st) if target is None else (None, None)  # rebound: ambiguous
+                elif isinstance(st, ast.ImportFrom) and st.module and st.module.startswith("sqlglot") and not st.level:
+                    for a in st.names:
+                        if (a.asname or a.name) == name and a.name != "*":
+                            mod = st.module.replace(".", "/")
+                            src = f"{mod}.py" if (SRC / f"{mod}.py").is_file() else f"{mod}/__init__.py"
+                            target = (src, a.name) if target is None else (None, None)
+            if target and target[0]:
+                where, st = target
+                t2 = self.pinned_tree(where)
+                if isinstance(st, str):  # imported: the definition in its own module
+                    defs = [d for d in (t2.body if t2 else ()) if name_of(d) == st]
+                    st = defs[0] if len(defs) == 1 else None
+                lazy = any(isinstance(x, ast.ImportFrom) and x.module == "__future__"
+                           and any(a.name == "annotations" for a in x.names) for x in (t2.body if t2 else ()))
+                cache[key] = isinstance(st, ast.FunctionDef) and is_closure_factory(st, lazy)
+        return cache[key]
+
+    def pinned_tree(self, rel):
+        cache = self.__dict__.setdefault("_trees", {})
+        if rel not in cache:
+            try:
+                cache[rel] = ast.parse((SRC / rel).read_text(encoding="utf-8"))
+            except (OSError, SyntaxError):
+                cache[rel] = None
+        return cache[rel]
+
+    def dict_value_change(self, path, o, n):
+        """A class-body dict literal whose keys are unchanged and whose entry values differ only
+        in constant leaves: tests that read one of those entries' values or read the dict in
+        bulk (traced). None -> rule not applicable."""
+        if type(o) is not type(n) or not isinstance(o, (ast.Assign, ast.AnnAssign)):
+            return None
+        if isinstance(o, ast.Assign):
+            if len(o.targets) != 1 or not isinstance(o.targets[0], ast.Name) or ast.dump(o.targets[0]) != ast.dump(n.targets[0]) \
+                    or len(n.targets) != 1:
+                return None
+        elif not isinstance(o.target, ast.Name) or ast.dump(o.target) != ast.dump(n.target) \
+                or ast.dump(o.annotation) != ast.dump(n.annotation):
+            return None
+        ov, nv = o.value, n.value
+        if not isinstance(ov, ast.Dict) or not isinstance(nv, ast.Dict) or len(ov.keys) != len(nv.keys):
+            return None
+        changed, explicit = [], 0
+        for ok, nk, oval, nval in zip(ov.keys, nv.keys, ov.values, nv.values):
+            if (ok is None) != (nk is None) or (ok is not None and ast.dump(ok) != ast.dump(nk)):
+                return None  # keys changed: not a value-only change
+            same = ast.dump(oval) == ast.dump(nval)
+            if ok is None:
+                if not same:
+                    return None  # **spread source changed
+                continue
+            if not same:
+                if not const_leaf_diff(oval, nval, lambda name: self.closure_factory(path, name)):
+                    return None
+                changed.append(explicit)
+            explicit += 1
+        v = self.vmap()
+        if not changed or not v:
+            return None
+        e = v["dict"].get(f"{path}:{ov.lineno}:{ov.col_offset}")
+        if e is None or not e["ok"] or e["n"] != explicit:
+            return None  # dict never created in the trace, or ambiguous entry positions
+        keys = [str(j) for j in changed] + ["*"]
+        if any(k in e["all"] for k in keys):
+            return None  # read outside any test (class creation, metaclass, session...)
+        out = set()
+        for k in keys:
+            if k in e["r"]:
+                out |= self.vnums(v, e["r"][k])
+        log(f"  {path}: class dict value change at {ov.lineno} entries {changed} -> {len(out)} reading tests")
+        return out
 
     STATIC = ("_fam_deps", "_derived", "_non_data", "_imp_uses")
 
@@ -979,6 +1259,10 @@ class Selector:
             self._dyn_pkgs = cache
         return cache
 
+    def opened_by(self, path):
+        idx = self.m.opens.get(path)
+        return self.m.nums(self.m.set(idx)) if idx is not None else set()
+
     def file_tests(self, path):
         return self.m.by_file.get(path, set())
 
@@ -1027,7 +1311,11 @@ class Selector:
                 # operands for which identity and equality agree by construction: every
                 # comparison returns what it did before, so the program runs unchanged
                 log(f"  {path}: identity/equality swap at interchangeable site(s) {sites} -> no tests")
-                return set()
+                return self.opened_by(path)  # tests reading this source file as text still see it
+        if not is_test_file and op_only_hunks(hunks):
+            r = self.op_change(path, old_tree, new_tree, old_touched | new_touched)
+            if r is not None:
+                return r | self.opened_by(path)
         # def/class header lines (decorators, signature, defaults) execute at import to
         # *create* the function/class; their effect shows up only through callers and
         # class users, which the header-change rules already select. Only statements
@@ -1070,6 +1358,11 @@ class Selector:
             elif r[0] == "lambda":
                 out |= self.m.nums(self.lines_bits(path, r[1]))
             elif r[0] == "class":
+                if len(r) > 3 and r[3] == "pair" and not is_test_file:
+                    dv = self.dict_value_change(path, r[2][0], r[2][1])
+                    if dv is not None:
+                        out |= dv
+                        continue
                 idx = self.m.users.get(f"{mod}:{r[1]}")
                 users = self.m.nums(self.m.set(idx)) if idx is not None else set()
                 # dialect metaclasses copy tokenizer/parser/generator settings across the

@@ -82,6 +82,24 @@ class EdgeCases(unittest.TestCase):
             "athk": udiff("sqlglot/parsers/athena.py", read("sqlglot/parsers/athena.py"),
                           read("sqlglot/parsers/athena.py").replace("{*TrinoParser.DDL_SELECT_TOKENS, TokenType.USING}",
                                                                     "{*TrinoParser.DDL_SELECT_TOKENS}", 1)),
+            # value trace (vmap.json.gz): class dict entry values / relational operators
+            "dval": udiff("sqlglot/dialects/snowflake.py", read("sqlglot/dialects/snowflake.py"),
+                          read("sqlglot/dialects/snowflake.py").replace('"u": (16, 4, 4, 0xFFFF)', '"u": (17, 4, 4, 0xFFFF)', 1)),
+            "dkey": udiff("sqlglot/dialects/snowflake.py", read("sqlglot/dialects/snowflake.py"),
+                          read("sqlglot/dialects/snowflake.py").replace('"u": (16, 4, 4, 0xFFFF)', '"v": (16, 4, 4, 0xFFFF)', 1)),
+            "dfac": udiff("sqlglot/parsers/singlestore.py", read("sqlglot/parsers/singlestore.py"),
+                          read("sqlglot/parsers/singlestore.py").replace('"GROUPS FOR USER": _show_parser("GROUPS FOR USER", target=True)',
+                                                                         '"GROUPS FOR USER": _show_parser("GROUPS FOR USER", target=False)', 1)),
+            "dcall": udiff("sqlglot/parsers/singlestore.py", read("sqlglot/parsers/singlestore.py"),
+                           read("sqlglot/parsers/singlestore.py").replace('"GROUPS FOR USER": _show_parser("GROUPS FOR USER", target=True)',
+                                                                          '"GROUPS FOR USER": _show_parser("GROUPS FOR USER", target=bool(1))', 1)),
+            "oplt": udiff("sqlglot/generators/clickhouse.py", read("sqlglot/generators/clickhouse.py"),
+                          read("sqlglot/generators/clickhouse.py").replace("version < (23, 12) and unit", "version <= (23, 12) and unit", 1)),
+            "opmix": udiff("sqlglot/generators/clickhouse.py", read("sqlglot/generators/clickhouse.py"),
+                           read("sqlglot/generators/clickhouse.py").replace("version < (23, 12) and unit", "version <= (23, 12) and unit", 1)
+                           .replace('return self.func("dateTrunc", unit,', 'return self.func("dateTrunX", unit,', 1)),
+            "opeq": udiff("sqlglot/parsers/dremio.py", read("sqlglot/parsers/dremio.py"),
+                          read("sqlglot/parsers/dremio.py").replace("        if len(args) == 2:\n", "        if len(args) != 2:\n", 1)),
             "nopt": udiff("sqlglot/optimizer/zz_rule.py", None, "def zz_rule(expression):\n    return expression\n"),
             "delf": udiff("sqlglot/dialects/tsql.py", tsql, None),
             "tfil": udiff("tests/test_transpile.py", transpile,
@@ -267,6 +285,25 @@ class EdgeCases(unittest.TestCase):
         nums = {t["number"] for t in self.tests if t["file"] == "tests/test_sqlglotc.py"}
         self.assertTrue(nums and nums <= self.sel["sqgc"])
 
+    def test_value_trace_unread_dict_entry_selects_nothing(self):
+        self.assertEqual(self.sel["dval"], set())  # no test reads NUMERIC_ESCAPES["u"]'s value
+
+    def test_value_trace_key_or_call_changes_fall_back(self):
+        # a changed key is visible to key-only uses (in, iteration): normal class rules
+        self.assertGreater(len(self.sel["dkey"]), 100)
+        # a new call inside the value runs code at class creation: normal class rules
+        self.assertGreater(len(self.sel["dcall"]), 0)
+
+    def test_value_trace_closure_factory_argument(self):
+        # _show_parser only binds its arguments into a closure; no test reads this entry
+        self.assertEqual(self.sel["dfac"], set())
+
+    def test_value_trace_comparison_rules(self):
+        self.assertEqual(self.sel["oplt"], set())  # no traced execution had version == (23, 12)
+        self.assertGreater(len(self.sel["opmix"]), 0)  # an extra edit in the file: normal coverage
+        self.assertGreater(len(self.sel["opeq"]), 0)  # == -> != is not a traced relational site
+        self.assertIn("comparison operator change", self.stderr)
+
     def test_static_index_changes_nothing(self):
         self.assertEqual(self.raw_idx, self.raw)  # build-time index == lazy computation
         self.assertEqual(self.raw_bad, self.raw)  # corrupt index -> ignored
@@ -274,6 +311,31 @@ class EdgeCases(unittest.TestCase):
     def test_garbage_and_empty_patches_do_not_crash(self):
         self.assertIn("junk", self.sel)
         self.assertIn("empt", self.sel)
+
+
+class ConstLeafDiff(unittest.TestCase):
+    """Which class-dict entry value edits the value-trace rule may treat as 'value only'."""
+
+    def test_cases(self):
+        import ast
+
+        sys.path.insert(0, str(REPO))
+        from selector import const_leaf_diff
+
+        fac = lambda n: n == "fac"  # noqa: E731
+        cases = [
+            ("(1, 2)", "(1, 3)", True), ("{'a': 1}", "{'a': 2}", True), ("-1", "-2", True),
+            ("1/2", "1/0", False),  # evaluated at class creation, may raise
+            ("lambda s: s.f(1)", "lambda s: s.f(2)", True),  # body runs only when called
+            ("lambda s, k=1: k", "lambda s, k=2: k", False), ("lambda s, k=1/2: k", "lambda s, k=1/0: k", False),
+            ("f(1)", "f(2)", False),  # unknown call runs at class creation
+            ("fac('A')", "fac('B')", True), ("fac(x='A')", "fac(x='B')", True),  # closure factory
+            ("fac(g(1))", "fac(g(2))", False), ("x[0]", "x[1]", False),
+            ("[i for i in (1,)]", "[i for i in (2,)]", False),
+        ]
+        for a, b, want in cases:
+            with self.subTest(a=a, b=b):
+                self.assertEqual(const_leaf_diff(ast.parse(a, mode="eval").body, ast.parse(b, mode="eval").body, fac), want)
 
 
 class FillIdle(unittest.TestCase):

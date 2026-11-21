@@ -22,7 +22,7 @@ import time
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
-FILES = ("selector.py", "map.json.gz", "eqsites.json")
+FILES = ("selector.py", "map.json.gz", "eqsites.json", "vmap.json.gz")
 
 
 def export(rev, dest):
@@ -40,7 +40,7 @@ def export(rev, dest):
 
 def run_once(py, d, data, src):
     env = dict(os.environ, BR_DATA=str(data), BR_SRC=str(src), BR_MAP=str(d / "map.json.gz"),
-               BR_EQ=str(d / "eqsites.json"), PYTHONDONTWRITEBYTECODE="1")
+               BR_EQ=str(d / "eqsites.json"), BR_VMAP=str(d / "vmap.json.gz"), PYTHONDONTWRITEBYTECODE="1")
     env.pop("BR_OFF", None)
     # wait4 gives this child's own rusage (CPU + max RSS)
     t0 = time.perf_counter()
