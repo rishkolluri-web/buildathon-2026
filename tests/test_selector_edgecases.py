@@ -420,6 +420,21 @@ class EdgeCases(unittest.TestCase):
         self.assertIn("junk", self.sel)
         self.assertIn("empt", self.sel)
 
+    def test_indexed_mentions_equal_regex_scan(self):
+        # the build-time word index must answer test_files_mentioning exactly like the regex scan, for
+        # every traced attribute name the selector can ask about
+        import gzip
+        sys.path.insert(0, str(REPO))
+        import selector as S
+        sel = S.Selector(S.Map(S.MAP, self.tests))
+        names = sorted(n for n in json.load(gzip.open(REPO / "vmap.json.gz", "rt"))["attr"] if S._UPPER_NAME.match(n))
+        lazy = {n: sel.test_files_mentioning(n) for n in names}
+        sel2 = S.Selector(S.Map(S.MAP, self.tests))
+        sel2.test_words()
+        self.assertGreater(len(names), 100)
+        for n in names:
+            self.assertEqual(sel2.test_files_mentioning(n), lazy[n], n)
+
 
 class ConstLeafDiff(unittest.TestCase):
     """Which class-dict entry value edits the value-trace rule may treat as 'value only'."""

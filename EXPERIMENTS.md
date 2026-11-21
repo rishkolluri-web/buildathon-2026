@@ -303,3 +303,21 @@ Diagnosis: 3 official submissions at exactly 174.5 s while the sample improved. 
   of 87 census and/or sites >= 25 s, tpcds saw only result-preserving combinations at 13, test_max_nodes at 4.
   Expected hidden gain ~1-2 s per submission (and/or ~15 % of sites x 15 % droppable x ~20 s x ~2 costly commits):
   negligible against a vtrace rebuild + truth corpus + gate. Not implemented.
+
+### experiment/cpu-v18 (base a1dbd42 = v17 ecf5f82 + logs): CPU only, selections byte-identical
+
+- Why: v14/v16/v17 all 172.2 s with 171.078 s simulated; only container CPU differs (1.08-1.14 s). ALL packing is
+  already at its lower bound (36.817 s = 28.817 + 4 x 2), so simulated time cannot move without hidden-set changes.
+  /code-review (high) of v17: 9 findings (5 important) — latent sharedmut guard gaps / over-broad value keys; none
+  changes hidden cost; deferred (not mixed into this CPU-only candidate).
+- Unprofiled selector CPU on the sample (v17, with index): ~0.21 s; ast.parse 0.078, Differ.key 0.028,
+  test_files_mentioning regex scan over tests/ 0.025, selector.py compile ~0.011.
+- Changes: (1) `_test_words` in static_index.pkl: UPPER-name -> test files containing it as a whole \w+ token
+  (= the `\bNAME\b` scan); test_files_mentioning uses it when present, regex scan otherwise. Index 49 -> 139 KB.
+  (2) Dockerfile compiles /app/selector.py to an unchecked-hash .pyc and CMD imports it
+  (`python -c "import sys; sys.path.insert(0, '/app'); import selector; selector.main()"`).
+- Equivalence: stdout byte-identical to v17 (each with its own index) on the sample (30), all 384 corpus patches,
+  the 1,500-site uniform census, and on the no-index path. Unit test: indexed mentions == regex scan for all traced
+  UPPER attribute names. Unit tests 66 OK. Gate vs ecf5f82 (all corpora): PASS, 0/30, 0/335, +0.0 s, fill 0.0 s.
+- CPU (image-like app dirs, own index, PYTHONDONTWRITEBYTECODE=1, 9 interleaved runs): v17 `python selector.py`
+  0.2275 s median -> v18 pyc import entry 0.1902 s (-0.037 s, -16 %).

@@ -1185,7 +1185,7 @@ class Selector:
         log(f"  {path}: class dict value change at {ov.lineno} entries {changed} -> {len(out)} reading tests")
         return out
 
-    STATIC = ("_fam_deps", "_derived", "_non_data", "_imp_uses", "_test_importers", "_shared_mut")
+    STATIC = ("_fam_deps", "_derived", "_non_data", "_imp_uses", "_test_importers", "_shared_mut", "_test_words")
 
     def shared_mut_hit(self, old_tree, new_tree, qual):
         """Names of class `qual` whose edit can steer an import-time in-place mutation of a shared
@@ -1273,6 +1273,7 @@ class Selector:
         for k in sorted(keys):
             self.non_data_names(k)
         self.shared_mut()
+        self.test_words()
         if self.test_importers() is ALL:  # never ship a sentinel: recompute lazily (-> ALL) at run time
             raise SystemExit("test import graph unresolved at the pinned commit")
         idx = {k: self.__dict__[k] for k in self.STATIC}
@@ -1385,8 +1386,26 @@ class Selector:
         out |= self.test_files_mentioning(nm)
         return out
 
+    def test_words(self):
+        """word -> test files (relative paths) containing it as a whole \\w+ token: precomputed form of the
+        regex scan in test_files_mentioning (`\\bNAME\\b` matches exactly where NAME is a maximal word run)."""
+        if "_test_words" not in self.__dict__:
+            words = {}
+            for f in sorted((SRC / "tests").rglob("*.py")) if (SRC / "tests").is_dir() else []:
+                rel = str(f.relative_to(SRC))
+                for w in set(re.findall(r"\w+", f.read_text(encoding="utf-8"))):
+                    if _UPPER_NAME.match(w):  # the only names traced_attr_readers asks about
+                        words.setdefault(w, []).append(rel)
+            self._test_words = words
+        return self._test_words
+
     def test_files_mentioning(self, nm):
         cache = self.__dict__.setdefault("_mention", {})
+        if nm not in cache and "_test_words" in self.__dict__ and re.fullmatch(r"\w+", nm) and _UPPER_NAME.match(nm):
+            hit = set()
+            for rel in self._test_words.get(nm, ()):
+                hit |= self.file_tests(rel)
+            cache[nm] = hit
         if nm not in cache:
             hit = set()
             pat = re.compile(r"\b%s\b" % re.escape(nm))

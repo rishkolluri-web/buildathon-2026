@@ -14,7 +14,10 @@ ENV BR_SRC=/opt/sqlglot BR_MAP=/app/map.json.gz PYTHONDONTWRITEBYTECODE=1
 COPY selector.py map.json.gz eqsites.json vmap.json.gz heavy.json iso_imp.json.gz /app/
 # Static indexes over the pinned sources (cross-dialect references, import uses), computed
 # once here instead of on every run; the selector recomputes them if this file is absent.
+# The selector's own bytecode is compiled once here (a script run as `python file.py` is recompiled on every
+# start); unchecked-hash .pyc files are used as-is regardless of mtimes. PYTHONDONTWRITEBYTECODE only stops writes.
 RUN python /app/selector.py --build-index /app/static_index.pkl \
-    && chmod 755 /app && chmod 644 /app/selector.py /app/map.json.gz /app/eqsites.json /app/vmap.json.gz /app/heavy.json /app/iso_imp.json.gz /app/static_index.pkl
+    && python -m compileall -q --invalidation-mode unchecked-hash /app/selector.py \
+    && chmod 755 /app /app/__pycache__ && chmod 644 /app/selector.py /app/map.json.gz /app/eqsites.json /app/vmap.json.gz /app/heavy.json /app/iso_imp.json.gz /app/static_index.pkl /app/__pycache__/*.pyc
 
-CMD ["python", "/app/selector.py"]
+CMD ["python", "-c", "import sys; sys.path.insert(0, '/app'); import selector; selector.main()"]
