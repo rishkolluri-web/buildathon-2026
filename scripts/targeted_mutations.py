@@ -32,7 +32,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--src", required=True)
     ap.add_argument("--out", required=True)
-    ap.add_argument("--set", default="t", choices=["t", "u", "v"], help="t: first targeted set; u: follow-up set; v: scoped-class-data/new-dialect audit")
+    ap.add_argument("--set", default="t", choices=["t", "u", "v", "w"], help="t: first targeted set; u: follow-up set; v: scoped-class-data/new-dialect audit; w: attribute-level cross-dialect narrowing")
     a = ap.parse_args()
     src, out = Path(a.src), Path(a.out)
     (out / "commits").mkdir(parents=True, exist_ok=True)
@@ -107,6 +107,18 @@ def main():
             # new dialect modules: second probed unknown name, and a name a test defines itself
             "v7-newdialect-unknownname": [("sqlglot/dialects/asdfjasodiufjsd.py", None, dia.format("Asdfjasodiufjsd"))],
             "v8-newdialect-testdefined": [("sqlglot/dialects/mydialect.py", None, dia.format("Mydialect"))],
+        }
+    elif a.set == "w":
+        # settings of dialects other families import (MySQL, Hive): attribute-level tracking
+        # stops propagating them to families that never read them; plus a cross-dialect read
+        # through a module import (generator.py -> sqlglot.dialects.tsql.TSQL.CONVERT_FORMAT_MAPPING)
+        muts = {
+            "w1-mysql-double-negation": [edit("sqlglot/dialects/mysql.py", "    SAFE_TO_ELIMINATE_DOUBLE_NEGATION = False\n", "    SAFE_TO_ELIMINATE_DOUBLE_NEGATION = True\n")],
+            "w2-mysql-promote-datetime": [edit("sqlglot/dialects/mysql.py", "    PROMOTE_TO_INFERRED_DATETIME_TYPE = True\n", "    PROMOTE_TO_INFERRED_DATETIME_TYPE = False\n")],
+            "w3-mysqlgen-limit-literals": [edit("sqlglot/generators/mysql.py", "    LIMIT_ONLY_LITERALS = True\n", "    LIMIT_ONLY_LITERALS = False\n")],
+            "w4-mysqlgen-null-ordering": [edit("sqlglot/generators/mysql.py", "    NULL_ORDERING_SUPPORTED: bool | None = None\n", "    NULL_ORDERING_SUPPORTED: bool | None = True\n")],
+            "w5-hivegen-properties-prefix": [edit("sqlglot/generators/hive.py", '    WITH_PROPERTIES_PREFIX = "TBLPROPERTIES"\n', '    WITH_PROPERTIES_PREFIX = "PROPERTIES"\n')],
+            "w6-tsql-convert-format": [edit("sqlglot/dialects/tsql.py", '        "1": "%m/%d/%y",\n', '        "1": "%d/%m/%y",\n')],
         }
     else:
         muts = {k: [v] for k, v in muts.items()}

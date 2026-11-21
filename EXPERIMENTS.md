@@ -121,3 +121,12 @@ c003640 known gap: a new sqlglot/dialects/<name>.py (u1) breaks test_get_or_rais
 | BB-709BA77F | 107a4c369c20be07204f3ab85719d92807f57640 | 222.0 s | 220.777 s | ~1.2 s | 0 |
 
 c1 (Teradata "DD") full-suite truth: 2 new failures; c003640 and b2c241e miss test_presto::test_to_char (#624), aa103eb selects both.
+
+### experiment/attrdeps-v7 (WIP, NOT a submission candidate yet)
+
+One rule vs aa103eb: cross-dialect propagation is attribute-level. A reference to family Y whose uses provably read only raw UPPER_CASE constants other than the changed ones (not stored/mutated by code = not metaclass-derived, not class/def names) adds nothing; subclass-only uses follow references to the subclass family without adding users; import-time copies continue with attributes unknown; string-literal lookups (Dialect["teradata"]), star imports, unknown attrs -> aa103eb behaviour. Also catches `import sqlglot.dialects.tsql` (generator.py -> TSQL.CONVERT_FORMAT_MAPPING), invisible to aa103eb's regex.
+- Sweep of 710 class settings in referenced dialects: saves 785.9 s on 85 settings vs aa103eb, never wider.
+- Cross-dialect truth (../stress_c): c1 Teradata "DD" 2 failing (test_to_char #624 + test_teradata::test_cast); c2 MySQL TIME_MAPPING 16 failing -- c003640 and b2c241e MISS test_hive::test_time (#434); c3 Hive TIME_MAPPING 9 failing. aa103eb and v7 select all.
+- Narrowing truth (../stress_w): w1 MySQL SAFE_TO_ELIMINATE_DOUBLE_NEGATION 1 failing, v7 selects 7 tests, 0 missed (aa103eb 652, c003640 1096). w2-w6 pending (truth runs stalled by iCloud eviction of ../.venv313; re-downloading).
+- Regression tests: Teradata->Presto test_to_char; MySQL mapping -> test_hive::test_time, Presto test_to_char/test_time, SingleStore, T-SQL; Hive mapping -> Presto/Spark/T-SQL. Unit tests OK.
+- CPU (loaded machine): sample c003640 0.214 / aa103eb 0.322 / v7 0.440 s.

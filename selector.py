@@ -562,7 +562,12 @@ class Selector:
 
     FAMILY_DIRS = ("dialects", "parsers", "generators", "tokenizers", "typing")
 
-    def family_users(self, path):
+    def family_users(self, path, attrs=None):
+        """Users of this dialect family, plus tests reached through cross-dialect
+        references to it. attrs: names bound by the changed class-level statements (None =
+        unknown). A reference that provably reads only OTHER attributes adds nothing; one
+        that only uses the class as a base adds nothing itself (subclass instances already
+        count as users of the base) but references to the subclass family are followed."""
         if "family" in OFF:
             return set()
         parts = path.split("/")
@@ -571,21 +576,45 @@ class Selector:
         base = parts[2][:-3]
         if base in ("__init__", "dialect"):
             return set()
+        if attrs is not None and any(a.startswith("__") for a in attrs):
+            attrs = None
         fams, sites = {base}, []
+        follow = {(base, None if attrs is None else frozenset(attrs))}
         if "famdeps" not in OFF:
             refs = self.family_dependents()
-            work = [base]
+            work = list(follow)
             while work:
-                k = work.pop()
+                k, hop_attrs = work.pop()
+                todo = []
                 for rel, ln, fam in refs.get(k, ()):
+                    uses = self.import_uses(rel).get(k) if hop_attrs is not None and "attrdeps" not in OFF else None
+                    if uses is None:  # string literal, or attribute set unknown: as before
+                        todo.append((rel, ln, fam, "use"))
+                    elif ln in uses:
+                        todo.append((rel, ln, fam, self.use_kind(uses[ln], hop_attrs, k)))
+                    else:  # the import statement: the data flows through each line using it
+                        todo += [(rel, uln, fam, self.use_kind(lst, hop_attrs, k)) for uln, lst in uses.items()]
+                for rel, ln, fam, kind in dict.fromkeys(todo):
+                    if kind == "none":
+                        continue
+                    if kind == "base":  # subclass: same attributes, inherited under the same names
+                        if fam and (fam, hop_attrs) not in follow:
+                            follow.add((fam, hop_attrs))
+                            work.append((fam, hop_attrs))
+                        elif not fam:
+                            sites.append((rel, None))
+                        continue
                     if ln in self.m.imp.get(rel, set()):
                         # import-time reference (class-body copy such as Presto.TIME_MAPPING =
                         # MySQL.TIME_MAPPING, or a lookup bound at import): the data spreads to
                         # every user of the referencing family, and on to ITS dependents
-                        if fam and fam not in fams:
+                        if fam:
                             fams.add(fam)
-                            work.append(fam)
-                        elif not fam:
+                            # the copy may be stored under ANY name: follow with attributes unknown
+                            if (fam, None) not in follow:
+                                follow.add((fam, None))
+                                work.append((fam, None))
+                        else:
                             sites.append((rel, None))
                     else:
                         # runtime reference (Dialect["teradata"] inside a function): only tests
@@ -605,7 +634,136 @@ class Selector:
                 bits |= self.lines_bits(rel, [ln])
         return self.m.nums(bits)
 
-    FAM_IMPORT = r"^\s*from\s+sqlglot\.(?:dialects|parsers|generators|tokenizers|typing)\.(\w+)\s+import"
+    DERIVED = re.compile(r"\.([A-Z][A-Z0-9_]*)(?:\s*=[^=]|\[[^\]]*\]\s*=[^=]|\.(?:update|setdefault|pop|popitem|"
+                         r"append|extend|insert|add|remove|discard|clear)\()")
+
+    def derived_names(self):
+        """UPPER_CASE attribute names that some code stores or mutates in place
+        (klass.INVERSE_TIME_MAPPING = ..., gen_cls.TRANSFORMS.pop(...)): their values can
+        depend on OTHER settings (the dialect metaclass derives them at import). Derived
+        from the pinned source, cached."""
+        cache = self.__dict__.get("_derived")
+        if cache is None:
+            cache = set()
+            root = SRC / "sqlglot"
+            for f in sorted(root.rglob("*.py")) if root.is_dir() else []:
+                try:
+                    cache |= {m.group(1) for m in self.DERIVED.finditer(f.read_text(encoding="utf-8"))}
+                except OSError:
+                    continue
+            self._derived = cache
+        return cache
+
+    def use_kind(self, uses, attrs, key=None):
+        """Combine the uses on one line: "use" if any may read the changed attributes,
+        else "base" if the imported class is subclassed there, else "none"."""
+        derived = self.derived_names() | (self.non_data_names(key) if key else set())
+        kinds = {self.classify(u, attrs, derived) for u in uses}
+        return "use" if "use" in kinds else ("base" if "base" in kinds else "none")
+
+    @staticmethod
+    def classify(use, attrs, derived=frozenset()):
+        kind, chain = use
+        if kind == "base":
+            return "base"
+        # X.NAME... reads exactly NAME from the class (what follows is read from NAME's value).
+        # Provably unrelated only if NAME is a raw data constant: UPPER_CASE, never stored or
+        # mutated by code (so it holds its class-body value), and not one of the changed names.
+        # Methods (format_time), nested classes (Parser) and derived constants
+        # (INVERSE_TIME_MAPPING, built from TIME_MAPPING by the metaclass) can carry it on.
+        if kind == "attr" and chain and chain[0].isupper() and chain[0] not in attrs and chain[0] not in derived:
+            return "none"
+        return "use"
+
+    def non_data_names(self, key):
+        """Names defined by `class`/`def` in family `key`'s files (nested classes, methods,
+        properties): reading one is not reading a plain constant."""
+        cache = self.__dict__.setdefault("_non_data", {})
+        if key not in cache:
+            names = set()
+            for d in self.FAMILY_DIRS:
+                f = SRC / "sqlglot" / d / f"{key}.py"
+                try:
+                    names |= set(re.findall(r"^\s*(?:async\s+)?(?:class|def)\s+(\w+)", f.read_text(encoding="utf-8"), re.M))
+                except OSError:
+                    continue
+            cache[key] = names
+        return cache[key]
+
+    def import_uses(self, rel):
+        """{family key: {line: [(kind, attribute chain)]}} for every load of a name a file
+        imports from a dialect family (`from sqlglot.<fam>.<key> import X` -> X..., or
+        `import sqlglot.<fam>.<key>` -> sqlglot.<fam>.<key>.X...). kind: "base" (in a class's
+        bases), "attr" (X.a.b read: chain [a, b]), "other" (anything else). Cached per file."""
+        cache = self.__dict__.setdefault("_imp_uses", {})
+        if rel in cache:
+            return cache[rel]
+        out = {}
+        cache[rel] = out
+        try:
+            tree = ast.parse((SRC / rel).read_text(encoding="utf-8"))
+        except (OSError, SyntaxError):
+            return out
+        local, dotted, starred = {}, {}, set()
+        for n in ast.walk(tree):
+            if isinstance(n, ast.ImportFrom) and n.module:
+                m = n.module.split(".")
+                if len(m) == 3 and m[0] == "sqlglot" and m[1] in self.FAMILY_DIRS:
+                    for a in n.names:
+                        if a.name == "*":  # names unknown: this key stays conservative
+                            starred.add(m[2])
+                        local[a.asname or a.name] = m[2]
+            elif isinstance(n, ast.Import):
+                for a in n.names:
+                    m = a.name.split(".")
+                    if len(m) == 3 and m[0] == "sqlglot" and m[1] in self.FAMILY_DIRS and not a.asname:
+                        dotted[(m[1], m[2])] = m[2]
+        if not local and not dotted:
+            return out
+        parent, in_bases = {}, set()
+        for n in ast.walk(tree):
+            for c in ast.iter_child_nodes(n):
+                parent[id(c)] = n
+            if isinstance(n, ast.ClassDef):
+                for b in n.bases:
+                    for x in ast.walk(b):
+                        in_bases.add(id(x))
+
+        def climb(node):
+            chain, top = [], node
+            while isinstance(parent.get(id(top)), ast.Attribute) and parent[id(top)].value is top:
+                top = parent[id(top)]
+                chain.append(top.attr)
+            return chain, top
+
+        for n in ast.walk(tree):
+            if not (isinstance(n, ast.Name) and isinstance(n.ctx, ast.Load)):
+                continue
+            if n.id in local:
+                key, skip = local[n.id], 0
+            elif n.id == "sqlglot" and dotted:
+                chain, _ = climb(n)
+                key = dotted.get(tuple(chain[:2]))
+                if key is None or len(chain) < 3:
+                    continue
+                skip = 3  # sqlglot.<fam>.<key>.<Class>.attr... -> attributes after the class
+            else:
+                continue
+            chain, top = climb(n)
+            chain = chain[skip:]
+            if id(n) in in_bases:
+                kind = "base"
+            elif chain and isinstance(top.ctx, ast.Load):
+                kind = "attr"
+            else:
+                kind = "other"
+            out.setdefault(key, {}).setdefault(n.lineno, []).append((kind, chain))
+        for k in starred:
+            out.pop(k, None)  # -> reference_kind/use: conservative
+        return out
+
+    FAM_IMPORT = (r"^\s*(?:from\s+sqlglot\.(?:dialects|parsers|generators|tokenizers|typing)\.(\w+)\s+import"
+                  r"|import\s+sqlglot\.(?:dialects|parsers|generators|tokenizers|typing)\.(\w+)\s*$)")
     REGISTRY = ("sqlglot/dialects/dialect.py", "sqlglot/dialects/__init__.py")
 
     def family_dependents(self):
@@ -637,7 +795,7 @@ class Selector:
                     except OSError:
                         continue
                     for i, line in enumerate(text.split("\n"), 1):
-                        found = {m.group(1) for m in imp.finditer(line)} | {m.group(1) for m in lit.finditer(line)}
+                        found = {m.group(1) or m.group(2) for m in imp.finditer(line)} | {m.group(1) for m in lit.finditer(line)}
                         for k in found:
                             if k in keys and k != own:
                                 cache.setdefault(k, []).append((rel, i, own))
@@ -778,7 +936,14 @@ class Selector:
                 users = self.m.nums(self.m.set(idx)) if idx is not None else set()
                 # dialect metaclasses copy tokenizer/parser/generator settings across the
                 # family at import, so any class of the family can carry the change
-                users |= self.family_users(path)
+                attrs = None
+                if len(r) > 2 and r[2] and all(isinstance(st, (ast.Assign, ast.AnnAssign)) for st in r[2]):
+                    attrs = set()
+                    for st in r[2]:
+                        attrs |= bound_names(st)
+                    if not attrs or "__complex_target__" in attrs:
+                        attrs = None
+                users |= self.family_users(path, attrs)
                 readers = None if r[1] in enum_like else \
                     self.class_data_readers(path, r[2] if len(r) > 2 else None, is_test_file)
                 if readers is not None:

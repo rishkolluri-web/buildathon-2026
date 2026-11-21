@@ -57,6 +57,12 @@ class EdgeCases(unittest.TestCase):
             # cross-dialect: parsers/presto.py reads Dialect["teradata"].TIME_MAPPING at runtime
             "tdtm": udiff("sqlglot/dialects/teradata.py", read("sqlglot/dialects/teradata.py"),
                           read("sqlglot/dialects/teradata.py").replace('"DD": "%d",', '"DD": "%e",', 1)),
+            # cross-dialect: dialects/presto.py copies MySQL.TIME_MAPPING into its class at import
+            "mytm": udiff("sqlglot/dialects/mysql.py", read("sqlglot/dialects/mysql.py"),
+                          read("sqlglot/dialects/mysql.py").replace('"%e": "%-d",', '"%e": "%d",', 1)),
+            # cross-dialect: generators/presto.py reads Hive.INVERSE_TIME_MAPPING (derived at import)
+            "hvtm": udiff("sqlglot/dialects/hive.py", read("sqlglot/dialects/hive.py"),
+                          read("sqlglot/dialects/hive.py").replace('"d": "%-d",', '"d": "%d",', 1)),
             "nopt": udiff("sqlglot/optimizer/zz_rule.py", None, "def zz_rule(expression):\n    return expression\n"),
             "delf": udiff("sqlglot/dialects/tsql.py", tsql, None),
             "tfil": udiff("tests/test_transpile.py", transpile,
@@ -169,6 +175,22 @@ class EdgeCases(unittest.TestCase):
         # builder; the Presto test fails on this edit (verified on the pinned source)
         self.assertIn(self.num("tests/dialects/test_presto.py::TestPresto::test_to_char"), self.sel["tdtm"])
         self.assertLess(len(self.sel["tdtm"]), len(self.tests))
+
+    def test_cross_dialect_import_time_copy_selects_consumers(self):
+        # full-suite truth for this edit: 16 failing tests; c003640 and b2c241e missed #434
+        for t in ("tests/dialects/test_hive.py::TestHive::test_time",
+                  "tests/dialects/test_presto.py::TestPresto::test_to_char",
+                  "tests/dialects/test_presto.py::TestPresto::test_time",
+                  "tests/dialects/test_singlestore.py::TestSingleStore::test_time_formatting",
+                  "tests/dialects/test_tsql.py::TestTSQL::test_convert"):
+            self.assertIn(self.num(t), self.sel["mytm"], t)
+
+    def test_cross_dialect_derived_mapping_selects_consumers(self):
+        # full-suite truth for this edit: 9 failing tests (INVERSE_TIME_MAPPING is derived)
+        for t in ("tests/dialects/test_presto.py::TestPresto::test_time",
+                  "tests/dialects/test_spark.py::TestSpark::test_spark",
+                  "tests/dialects/test_tsql.py::TestTSQL::test_format"):
+            self.assertIn(self.num(t), self.sel["hvtm"], t)
 
     def test_family_dependents_found_in_source(self):
         sys.path.insert(0, str(REPO))
