@@ -604,6 +604,30 @@ class Selector:
             self._enum_tests = cache
         return set(cache)
 
+    DYN_IMPORT = re.compile(r"""import_module\(\s*f["']([\w.]*?)\.?\{""")
+    DYN_SELF = re.compile(r"""import_module\(\s*f["']\{__name__\}\.""")
+
+    def name_loaded_packages(self):
+        """Packages (dotted) whose submodules the pinned sqlglot imports by a name computed
+        at runtime: import_module(f"pkg.{x}") anywhere, or import_module(f"{__name__}.{x}")
+        in a package __init__. Derived from the pinned source, cached."""
+        cache = self.__dict__.get("_dyn_pkgs")
+        if cache is None:
+            cache = set()
+            root = SRC / "sqlglot"
+            for f in sorted(root.rglob("*.py")) if root.is_dir() else []:
+                try:
+                    text = f.read_text(encoding="utf-8")
+                except OSError:
+                    continue
+                if "import_module" not in text:
+                    continue
+                cache |= {m.group(1) for m in self.DYN_IMPORT.finditer(text) if m.group(1)}
+                if f.name == "__init__.py" and self.DYN_SELF.search(text):
+                    cache.add(module_name(str(f.relative_to(SRC))))
+            self._dyn_pkgs = cache
+        return cache
+
     def file_tests(self, path):
         return self.m.by_file.get(path, set())
 
@@ -618,6 +642,17 @@ class Selector:
             # will find and import it
             if is_test_file:
                 return set()
+            if path.startswith("sqlglot/dialects/"):
+                # Dialect._try_load also imports a module named by the requested dialect.
+                # Existing tests may request that name expecting an unknown-dialect error.
+                return ALL
+            mod = module_name(path)
+            if any(mod.startswith(p + ".") for p in self.name_loaded_packages()):
+                # sqlglot imports submodules of this package by a runtime name (lazy
+                # __getattr__, dialect lookup): the new module changes what such a name
+                # resolves to, which any test may probe
+                log(f"  {path}: new module in a package loaded by name -> all tests")
+                return ALL
             return self.package_enumerator_tests()
         old_lines = old_text.split("\n")
         new_lines, old_touched, new_touched = apply_hunks(old_lines, hunks)

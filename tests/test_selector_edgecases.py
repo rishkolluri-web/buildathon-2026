@@ -52,6 +52,9 @@ class EdgeCases(unittest.TestCase):
             "synt": udiff("sqlglot/optimizer/scope.py", scope, scope.replace("def traverse_scope(", "def traverse_scope((", 1)),
             "cmnt": udiff("sqlglot/helper.py", helper, helper.replace("\ndef ", "\n# just a note\ndef ", 1)),
             "newf": udiff("sqlglot/brand_new.py", None, "X = 1\n"),
+            "ndia": udiff("sqlglot/dialects/myqsl.py", None,
+                          "from sqlglot.dialects.dialect import Dialect\n\nclass Myqsl(Dialect):\n    pass\n"),
+            "nopt": udiff("sqlglot/optimizer/zz_rule.py", None, "def zz_rule(expression):\n    return expression\n"),
             "delf": udiff("sqlglot/dialects/tsql.py", tsql, None),
             "tfil": udiff("tests/test_transpile.py", transpile,
                           transpile.replace("def test_weird_chars(self):\n", "def test_weird_chars(self):\n        self.assertTrue(False)\n", 1)),
@@ -136,6 +139,18 @@ class EdgeCases(unittest.TestCase):
         typing_tests = {t["number"] for t in self.tests if t["file"] == "tests/test_typing.py"}
         self.assertTrue(typing_tests and typing_tests <= self.sel["newf"])
         self.assertLess(len(self.sel["newf"]), len(self.tests))
+
+    def test_new_dialect_selects_unknown_name_checks(self):
+        # Dialect._try_load imports a module by the requested name; this addition
+        # breaks test_get_or_raise's expectation that "myqsl" is unknown.
+        self.assertIn(self.num("tests/dialects/test_dialect.py::TestDialect::test_get_or_raise"),
+                      self.sel["ndia"])
+
+    def test_new_module_in_name_loaded_package_selects_everything(self):
+        # sqlglot.optimizer.__getattr__ imports f"{__name__}.{name}": a new submodule turns
+        # a missing attribute into a real one, which no coverage map can attribute
+        self.assertEqual(len(self.sel["nopt"]), len(self.tests))
+        self.assertEqual(len(self.sel["ndia"]), len(self.tests))
 
     def test_nested_conftest_selects_everything(self):
         self.assertEqual(len(self.sel["cftn"]), len(self.tests))

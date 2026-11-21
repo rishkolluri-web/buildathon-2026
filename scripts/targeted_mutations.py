@@ -32,6 +32,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--src", required=True)
     ap.add_argument("--out", required=True)
+    ap.add_argument("--set", default="t", choices=["t", "u"], help="t: first targeted set; u: follow-up set")
     a = ap.parse_args()
     src, out = Path(a.src), Path(a.out)
     (out / "commits").mkdir(parents=True, exist_ok=True)
@@ -60,10 +61,41 @@ def main():
         "t6-classvar-set": edit("sqlglot/expressions/datatypes.py", "        DType.MEDIUMINT,\n", ""),
     }
     assert pg  # postgres typing module exists (T1 imports it)
+    if a.set == "u":
+        drill = edit("sqlglot/generators/drill.py", 'ARRAY_SIZE_NAME = "REPEATED_COUNT"', 'ARRAY_SIZE_NAME = "REPEATED_COUNT_X"')
+        muts = {
+            # new dialect module: Dialect._try_load imports sqlglot.dialects.<requested name>
+            "u1-newdialect": [("sqlglot/dialects/myqsl.py", None,
+                               "from sqlglot.dialects.dialect import Dialect\n\n\nclass Myqsl(Dialect):\n    pass\n")],
+            # new optimizer module: sqlglot.optimizer.__getattr__ falls back to importing <name>
+            "u2-newoptimizer": [("sqlglot/optimizer/zz_rule.py", None, "def zz_rule(expression):\n    return expression\n")],
+            # registration across files: new module with a Func subclass + star import of it
+            "u3-registration-multifile": [
+                ("sqlglot/expressions/zz_extra.py", None,
+                 "from sqlglot.expressions.core import Expression, Func\n\n\n"
+                 "class ReverseText(Expression, Func):\n    _sql_names = [\"REVERSE\"]\n"),
+                edit("sqlglot/expressions/__init__.py", "from sqlglot.expressions.string import *  # noqa: F401,F403\n",
+                     "from sqlglot.expressions.string import *  # noqa: F401,F403\n"
+                     "from sqlglot.expressions.zz_extra import *  # noqa: F401,F403\n")],
+            # two class-data edits in two files: selection must cover both failure sets
+            "u4-multifile-classattr": [
+                edit("sqlglot/parser.py", "LOG_DEFAULTS_TO_LN: t.ClassVar = False", "LOG_DEFAULTS_TO_LN: t.ClassVar = True"),
+                drill],
+            # base-class flag read via self.X, overridden in some dialect subclasses
+            "u5-base-flag": [edit("sqlglot/generator.py", "    SUPPORTS_UESCAPE = True\n", "    SUPPORTS_UESCAPE = False\n")],
+            # dialect name list consumed by dynamic lookups
+            "u6-dialects-list": [edit("sqlglot/dialects/__init__.py", '    "Drill",\n', "")],
+            # lazy attribute table: __getattr__ result is cached in globals() after first use
+            "u7-lazy-attr": [edit("sqlglot/optimizer/__init__.py",
+                                  '"traverse_scope": ("sqlglot.optimizer.scope", "traverse_scope"),',
+                                  '"traverse_scope": ("sqlglot.optimizer.scope", "walk_in_scope"),')],
+        }
+    else:
+        muts = {k: [v] for k, v in muts.items()}
     meta = {}
-    for mid, (path, old, new) in muts.items():
-        (out / "commits" / f"{mid}.patch").write_text(udiff(path, old, new))
-        meta[mid] = {"kind": mid.split("-", 1)[1], "file": path}
+    for mid, files in muts.items():
+        (out / "commits" / f"{mid}.patch").write_text("".join(udiff(*f) for f in files))
+        meta[mid] = {"kind": mid.split("-", 1)[1], "file": ",".join(f[0] for f in files)}
     (out / "meta.json").write_text(json.dumps(meta, indent=1))
     print(f"wrote {len(meta)} targeted mutations to {out}")
 

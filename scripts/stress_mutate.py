@@ -276,6 +276,23 @@ def pytest_sessionfinish(session, exitstatus):
 '''
 
 
+def apply_patch_files(src_root, patch):
+    """Return [(path, new_text or None for a deletion)] for every file in the diff."""
+    sys.path.insert(0, str(REPO))
+    import selector
+
+    out = []
+    for f in selector.parse_patch(patch):
+        if f["new"] is None:
+            out.append((f["old"], None))
+            continue
+        src = src_root / f["old"] if f["old"] else None
+        old = src.read_text().split("\n") if src is not None and src.exists() else []
+        new, _, _ = selector.apply_hunks(old, f["hunks"])
+        out.append((f["new"], "\n".join(new)))
+    return out
+
+
 def apply_patch_text(src_root, patch):
     """Return (path, new_text) for our own single-file generated diffs."""
     path = re.search(r"^\+\+\+ b/(\S+)", patch, re.M).group(1)
@@ -290,25 +307,31 @@ def apply_patch_text(src_root, patch):
 
 
 def run_truth(mid, a, src, out, plugin_dir):
-    res = out / "truth" / f"{mid}.json"
+    res = out / "truth" / (f"{mid}.{a.tag}.json" if a.tag else f"{mid}.json")
     if res.exists():
         return mid, "cached"
     work = Path(tempfile.mkdtemp(prefix=f"mut-{mid}-", dir=a.tmp))
     try:
-        for d in ("sqlglot", "tests"):
+        # sqlglotc/ is read by tests/test_sqlglotc.py (setUpClass); without it those
+        # three tests error in every copy, baseline included, and can't be verified
+        for d in ("sqlglot", "tests", "sqlglotc"):
             shutil.copytree(src / d, work / d, ignore=shutil.ignore_patterns("__pycache__"))
         for f in ("pyproject.toml", "setup.cfg", "setup.py"):
             if (src / f).exists():
                 shutil.copy(src / f, work / f)
         if mid != "base":
-            path, new = apply_patch_text(src, (out / "commits" / f"{mid}.patch").read_text())
-            (work / path).write_text(new)
+            for path, new in apply_patch_files(src, (out / "commits" / f"{mid}.patch").read_text()):
+                if new is None:
+                    (work / path).unlink(missing_ok=True)
+                else:
+                    (work / path).parent.mkdir(parents=True, exist_ok=True)
+                    (work / path).write_text(new)
         env = dict(os.environ, SKIP_INTEGRATION="0", PYTHONPATH=f"{work}:{plugin_dir}", MUT_RESULT=str(res) + ".tmp",
                    PATH=f"{Path(a.python).parent}:{os.environ['PATH']}", PYTHONDONTWRITEBYTECODE="1",
                    # tests spawn ProcessPoolExecutors sized to the CPU count; cap them so
                    # parallel mutant runs don't oversubscribe the machine (parallelism only)
                    PYTHON_CPU_COUNT=str(a.pool_cpus))
-        p = subprocess.run([a.python, "-m", "pytest", "tests", "-p", "mut_fail_plugin", "-p", "no:cacheprovider",
+        p = subprocess.run([a.python, "-m", "pytest", *(a.subset or ["tests"]), "-p", "mut_fail_plugin", "-p", "no:cacheprovider",
                             "-n", str(a.workers), "--timeout", str(a.timeout), "-q"],
                            cwd=work, env=env, capture_output=True, text=True, timeout=1800)
         if not Path(str(res) + ".tmp").exists():
@@ -331,6 +354,11 @@ def cmd_truth(a):
     if a.first:  # run these first (e.g. the mutants a narrowing change must be safe on)
         pri = [m for m in a.first.split(",") if m in mids]
         mids = ["base"] + pri + [m for m in mids[1:] if m not in pri]
+    if a.tag:
+        (out / "truth" / f"{a.tag}.paths.json").write_text(json.dumps(a.subset or ["tests"]))
+    if a.only:  # run just these mutants (plus base)
+        keep = set(a.only.split(","))
+        mids = ["base"] + [m for m in mids[1:] if m in keep]
     with ThreadPoolExecutor(a.jobs) as ex:
         for mid, status in ex.map(lambda m: run_truth(m, a, src, out, plugin_dir), mids):
             print(mid, status, flush=True)
@@ -415,6 +443,9 @@ def main():
     t.add_argument("--workers", type=int, default=4)
     t.add_argument("--tmp", default=None)
     t.add_argument("--pool-cpus", type=int, default=2)
+    t.add_argument("--only", default="", help="comma-separated mutant ids: run only these")
+    t.add_argument("--subset", nargs="*", help="run only these test paths (supplementary truth)")
+    t.add_argument("--tag", default="", help="with --subset: write truth/<id>.<tag>.json")
     t.add_argument("--first", default="", help="comma-separated mutant ids to run first")
     t.add_argument("--timeout", type=int, default=300, help="per-test pytest timeout; keep load low so only real hangs hit it")
     e = sub.add_parser("eval")

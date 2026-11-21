@@ -58,19 +58,46 @@ def load_truth(stress, tests):
     if not base_f.exists():
         return truth
     base = set(json.loads(base_f.read_text()))
-    for f in sorted((stress / "truth").glob("*.json")):
-        if f.stem == "base":
-            continue
+
+    def to_nums(nids):
         s = set()
-        for nid in set(json.loads(f.read_text())) - base:
+        for nid in nids:
             if nid.startswith("COLLECT::"):
                 s |= by_file.get(nid[9:], set()) or set(ms)
             elif nid == "SESSION_FAILED":
                 s |= set(ms)
             elif nid in num:
                 s.add(num[nid])
+        return s
+
+    # supplementary subset runs: truth/<id>.<tag>.json against truth/base.<tag>.json
+    tags = {f.name.split(".")[1] for f in (stress / "truth").glob("base.*.json")}
+    for f in sorted((stress / "truth").glob("*.json")):
+        if f.stem == "base" or "." in f.stem:
+            continue
+        s = to_nums(set(json.loads(f.read_text())) - base)
+        for tag in tags:
+            sup = stress / "truth" / f"{f.stem}.{tag}.json"
+            if sup.exists():
+                s |= to_nums(set(json.loads(sup.read_text())) - set(json.loads((stress / "truth" / f"base.{tag}.json").read_text())))
         truth[f.stem] = s
     return truth
+
+
+def unverifiable(stress):
+    """Baseline-failing test ids whose breakage this corpus cannot detect: failing in
+    truth/base.json and not re-run passing by a tagged subset run (truth/<tag>.paths.json
+    lists the subset's test paths, truth/base.<tag>.json its baseline failures)."""
+    base_f = stress / "truth" / "base.json"
+    if not base_f.exists():
+        return set()
+    bad = set(json.loads(base_f.read_text()))
+    for f in (stress / "truth").glob("*.paths.json"):
+        tag = f.name[: -len(".paths.json")]
+        paths = json.loads(f.read_text())
+        sub_base = set(json.loads((stress / "truth" / f"base.{tag}.json").read_text()))
+        bad = {n for n in bad if n in sub_base or not any(n.startswith(p) for p in paths)}
+    return bad
 
 
 def evaluate(py, sel, mp, src, kit, mdata, ms, off=""):
@@ -99,6 +126,9 @@ def main():
     ms = {t["number"]: round(t["seconds"] * 1000) for t in tests}
     answers = {f"s:{k}": set(v["failing"]) for k, v in json.loads((kit / "sample" / "answers.json").read_text())["commits"].items()}
     truth = {f"m:{k}": v for c in corpora for k, v in load_truth(c, tests).items()}
+    for c in corpora:
+        u = unverifiable(c)
+        print(f"  [info] {c.name}: {len(u)} baseline-failing test ids cannot be verified" + (f": {sorted(u)}" if u else ""))
 
     tmp = Path(tempfile.mkdtemp())
     mdata = tmp / "mdata"
