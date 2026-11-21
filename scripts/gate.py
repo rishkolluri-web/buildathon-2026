@@ -8,6 +8,8 @@ PASS only if ALL hold:
   3. all unit tests pass (python -m unittest discover -s tests)
   4. sample + mutation simulated cost strictly lower than HEAD's
   5. free-rider fill adds 0.0 s to every commit's busiest worker
+  6. every patch whose selection DROPS tests the base selected has ground truth
+     (a narrowing nobody can check is not accepted)
 
   python3 scripts/gate.py            # defaults assume ../blast-radius-sample, ../sqlglot, ../stress
 Exit code 0 = PASS, 1 = FAIL. Prints the measured numbers either way.
@@ -106,6 +108,7 @@ def main():
 
     s_miss = sorted(k for k, f in answers.items() if f - cand[k]["sel"])
     m_miss = sorted(k for k, f in truth.items() if f - cand[k]["sel"])
+    unverified = sorted(k for k in cand if k.startswith("m:") and k not in truth and base[k]["sel"] - cand[k]["sel"])
     fill_bad = sorted(k for k in cand if cand[k]["max"] != nofill[k]["max"] or cand[k]["cost"] != nofill[k]["cost"])
     cost = lambda r, p: sum(v["cost"] for k, v in r.items() if k.startswith(p)) / 1000  # noqa: E731
     c_s, c_m, b_s, b_m = cost(cand, "s:"), cost(cand, "m:"), cost(base, "s:"), cost(base, "m:")
@@ -123,6 +126,8 @@ def main():
         ("cost strictly lower than " + a.base, (c_s + c_m) < (b_s + b_m),
          f"sample {b_s:.1f}->{c_s:.1f}  mutants {b_m:.1f}->{c_m:.1f}  total {b_s + b_m:.1f}->{c_s + c_m:.1f} ({c_s + c_m - b_s - b_m:+.1f}s)"),
         ("fill adds 0.0 s to max worker", not fill_bad, f"{len(fill_bad)} commits differ" if fill_bad else "0.0 s on all"),
+        ("narrowed patches have ground truth", not unverified,
+         f"unverified: {unverified}" if unverified else "all narrowed patches verified"),
     ]
     for name, ok, detail in checks:
         print(f"  [{'PASS' if ok else 'FAIL'}] {name}: {detail}")
