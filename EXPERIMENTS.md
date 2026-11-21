@@ -303,3 +303,10 @@ Diagnosis: 3 official submissions at exactly 174.5 s while the sample improved. 
   of 87 census and/or sites >= 25 s, tpcds saw only result-preserving combinations at 13, test_max_nodes at 4.
   Expected hidden gain ~1-2 s per submission (and/or ~15 % of sites x 15 % droppable x ~20 s x ~2 costly commits):
   negligible against a vtrace rebuild + truth corpus + gate. Not implemented.
+
+### Official BB-D4968574 (ecf5f82, v17 = v16 + shared-container guard): 172.2 s, 0 misses
+
+- Runs: 171.078 / 171.078 / 171.078 s simulated, CPU 1.13 / 1.14 / 1.14 s, 0 commits missed. Simulated identical to v14 and
+  v16 (as expected: no hidden commit reaches the guard). CPU +0.05 s vs v16 (1.08/1.09/1.08): unrounded totals
+  ≈ 172.22 (v17) vs ≈ 172.16 (v16); both display 172.2 s. Local selector CPU with the index was 0.228 vs 0.231 s, so the
+  extra is mostly container/load variance or the larger static index; not investigated further.
