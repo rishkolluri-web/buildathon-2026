@@ -46,6 +46,8 @@ class EdgeCases(unittest.TestCase):
         transpile = read("tests/test_transpile.py")
         helpers = read("tests/helpers.py")
         errors = read("sqlglot/errors.py")
+        ddl = read("sqlglot/expressions/ddl.py")
+        functions = read("sqlglot/expressions/functions.py")
         cls.patches = {
             "synt": udiff("sqlglot/optimizer/scope.py", scope, scope.replace("def traverse_scope(", "def traverse_scope((", 1)),
             "cmnt": udiff("sqlglot/helper.py", helper, helper.replace("\ndef ", "\n# just a note\ndef ", 1)),
@@ -56,6 +58,9 @@ class EdgeCases(unittest.TestCase):
             "hlpr": udiff("tests/helpers.py", helpers, helpers.replace("def load_sql_fixtures(filename):\n", "def load_sql_fixtures(filename):\n    filename = filename.strip()\n", 1)),
             "mcon": udiff("sqlglot/helper.py", helper, helper.replace("\nlogger = ", "\nUNUSED_CONST = 3\nlogger = ", 1)),
             "rdme": udiff("README.md", "a\n", "b\n"),
+            "ncls": udiff("sqlglot/expressions/ddl.py", ddl, ddl.rstrip("\n") + "\n\n\nclass BrandNewProperty(Expression):\n    arg_types = {\"this\": True}\n"),
+            "star": udiff("sqlglot/expressions/functions.py", functions,
+                          functions.replace("from sqlglot.expressions.math import *  # noqa: F401,F403\n", "", 1)),
             "mrd": udiff("sqlglot/errors.py", errors, errors.replace("ERROR_MESSAGE_CONTEXT_DEFAULT = 100", "ERROR_MESSAGE_CONTEXT_DEFAULT = 101", 1)),
             "fxnw": udiff("tests/fixtures/optimizer/brand_new_case.sql", None, "SELECT 1;\nSELECT 1;\n"),
             "sqgc": udiff("sqlglotc/setup.py", "a = 1\n", "a = 2\n"),
@@ -102,6 +107,14 @@ class EdgeCases(unittest.TestCase):
 
     def test_config_change_selects_everything(self):
         self.assertEqual(len(self.sel["conf"]), len(self.tests))
+
+    def test_new_module_level_class_selects_everything(self):
+        # regression (Person 1): class creation registers subclasses; 0 tests was a miss
+        self.assertEqual(len(self.sel["ncls"]), len(self.tests))
+
+    def test_removed_star_import_selects_everything(self):
+        # regression (Person 1): removing `from x import *` broke imports with 0 tests selected
+        self.assertEqual(len(self.sel["star"]), len(self.tests))
 
     def test_new_unread_module_constant_selects_nothing(self):
         # nothing can read a brand-new name, so it cannot change any test's behaviour

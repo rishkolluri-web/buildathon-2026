@@ -417,6 +417,19 @@ class Selector:
         if any(isinstance(st, (ast.Import, ast.ImportFrom)) and ast.dump(st) not in old_imps for st in news):
             log(f"  {path}: new/changed import -> all tests")
             return ALL
+        for st in olds + news:
+            if isinstance(st, ast.ClassDef):
+                # class creation runs __init_subclass__/metaclass hooks that register the
+                # class (e.g. Expression subclasses); a new or removed class is observable
+                # without anyone reading its name
+                log(f"  {path}: module-level class {st.name} added/removed/renamed -> all tests")
+                return ALL
+            if isinstance(st, ast.ImportFrom) and any(a.name == "*" for a in st.names):
+                log(f"  {path}: star import changed -> all tests")  # binds unknown names
+                return ALL
+            if isinstance(st, (ast.FunctionDef, ast.AsyncFunctionDef)) and st.decorator_list:
+                log(f"  {path}: decorated module-level function {st.name} -> all tests")  # may register
+                return ALL
         names = set()
         for st in olds + news:
             names |= bound_names(st)
