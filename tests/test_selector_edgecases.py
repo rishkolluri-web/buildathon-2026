@@ -103,6 +103,15 @@ class EdgeCases(unittest.TestCase):
             # import-state rules: KEYWORDS is read at import AND at test time (tokens.py _init_core)
             "kwdel": udiff("sqlglot/dialects/athena.py", read("sqlglot/dialects/athena.py"),
                            read("sqlglot/dialects/athena.py").replace('        "UNLOAD": TokenType.COMMAND,\n', "", 1)),
+            # Person 1 audit: unexpected keyword in exp.Window(...) built at import; raises only under
+            # unittest/pytest (expressions/core.py UNITTEST) -> collection errors everywhere
+            "winkw": udiff("sqlglot/parser.py", read("sqlglot/parser.py"),
+                           "\n".join(l.replace("partition_by=partition,", "partition_by_X=partition,") if i == 9175 else l
+                                     for i, l in enumerate(read("sqlglot/parser.py").split("\n")))),
+            # import-time tokenization feeds a deep expression template (DuckDBGenerator.NORMAL_TEMPLATE)
+            "sci2": udiff("sqlglot/tokenizer_core.py", read("sqlglot/tokenizer_core.py"),
+                          "\n".join(l.replace("scientific += 1", "scientific += 2") if i == 1028 else l
+                                    for i, l in enumerate(read("sqlglot/tokenizer_core.py").split("\n")))),
             "nopt": udiff("sqlglot/optimizer/zz_rule.py", None, "def zz_rule(expression):\n    return expression\n"),
             "delf": udiff("sqlglot/dialects/tsql.py", tsql, None),
             "tfil": udiff("tests/test_transpile.py", transpile,
@@ -313,6 +322,15 @@ class EdgeCases(unittest.TestCase):
         # ran at import only as import-time reads; test_athena reads KEYWORDS via _init_core
         nums = {t["number"] for t in self.tests if t["id"] == "tests/dialects/test_athena.py::TestAthena::test_athena"}
         self.assertTrue(nums and nums <= self.sel["kwdel"])
+
+    def test_import_state_runs_in_test_environment(self):
+        # regression (Person 1): import-state must import sqlglot as tests do (UNITTEST=True)
+        self.assertEqual(self.sel["winkw"], {t["number"] for t in self.tests})
+
+    def test_import_state_sees_deep_values(self):
+        # regression: fingerprints must not truncate deep expression trees
+        nums = {t["number"] for t in self.tests if t["id"] == "tests/dialects/test_snowflake.py::TestSnowflake::test_snowflake"}
+        self.assertTrue(nums and nums <= self.sel["sci2"])
 
     def test_static_index_changes_nothing(self):
         self.assertEqual(self.raw_idx, self.raw)  # build-time index == lazy computation

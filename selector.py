@@ -1755,8 +1755,9 @@ def _fp(x, seen, depth=0, unordered=False):
     t = type(x)
     if x is None or t in (bool, int, float, complex, str, bytes):
         return f"{t.__name__}:{x!r}"
-    if depth > 12:
-        return "deep"
+    if depth > 400:
+        # never truncate (a truncated subtree would compare equal): fail closed -> all tests
+        raise RecursionError("import-state value too deep to fingerprint")
     if id(x) in seen:
         return "cycle"
     import enum
@@ -1872,6 +1873,13 @@ def import_state(root, patched=None):
 
     sys.meta_path.insert(0, Finder())
     sys.path.insert(0, root)
+    # Tests run with unittest/pytest loaded, and sqlglot changes import-time behaviour on that
+    # (expressions/core.py: UNITTEST = "unittest" in sys.modules or "pytest" in sys.modules ->
+    # unexpected constructor keywords raise). Reproduce the test environment, and fail closed if
+    # the flag did not take (snapshot would not represent how tests import sqlglot).
+    import unittest  # noqa: F401
+
+    sys.setrecursionlimit(max(sys.getrecursionlimit(), 20000))
     import sqlglot
 
     names = sorted(m.name for m in pkgutil.walk_packages(sqlglot.__path__, "sqlglot.") if m.name != "sqlglot.__main__")
@@ -1880,6 +1888,9 @@ def import_state(root, patched=None):
             names.append(module_name(rel))
     for name in names:
         importlib.import_module(name)
+    core = sys.modules.get("sqlglot.expressions.core")
+    if core is None or getattr(core, "UNITTEST", None) is not True:
+        raise RuntimeError("import-state environment does not match the test environment (UNITTEST)")
     out = {}
 
     def h(s):
