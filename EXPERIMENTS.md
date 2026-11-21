@@ -181,3 +181,24 @@ Equivalence evidence: scripts/diff_swap.py over EVERY single-op is/==/is not/!= 
 Unit test: build-time index == lazy == corrupt-index output on every edge-case patch.
 gate.py fix: the base revision now also gets its eqsites.json (before, gating against v8 ran v8 without
 its swap rule and overstated the base cost).
+
+### Official BB-27668580 (8991e94, experiment/testdep-fix): 174.5 s, 0 misses (173.564 s simulated, ~0.92 s CPU)
+
+### experiment/perf-v11 — diagnosis only (base 8991e94), no selector change
+
+scripts/cost_report.py (diagnostic copy from v10-fix; adds per-test single-drop savings), 217 patches with truth:
+| Group | n | cost | oracle | gap | zero-failure gap |
+|---|---|---|---|---|---|
+| sample | 30 | 101.6 | 94.4 | 7.2 | 6.7 (12 patches) |
+| random corpus ../stress (with truth) | 28 | 408.3 | 174.5 | 233.7 | 87.2 |
+| targeted corpora (b,c,d,f,h3,k,p,u,v,w,x) | 125 | 1700.1 | 310.0 | 1390.1 | 467.1 |
+| synthetic eq swaps (e,e2) | 30 | 147.3 | 27.5 | 119.8 | 110.5 |
+| test-only (t) | 4 | 33.1 | 13.9 | 19.2 | 12.7 |
+Sample+random gap by category: ALL import-time line 147.6 (6), ALL module-level/registration 36.8 (1), class-level
+data dialect family 21.4 (4), function body dialect family 15.7 (14), ALL syntax error 9.4 (1), class-level core 5.6 (2),
+optimizer/executor bodies 4.5 (6); everything else 0. Unneeded expensive tests (single-drop savings, sample+random):
+test_max_nodes 51.5 s (7, only via ALL), test_execute_tpcds 10.0 (5), test_generator_memory 9.1 (7).
+Conclusion: on sample-like changes the selector is within 7.2 s (7.6 %) of the oracle; the remaining measured gap is in
+ALL fallbacks (import-time lines, module-level/registration, syntax errors) that need per-test import provenance —
+v10's dynamic attempt was rejected, and no cheap static rule bounds them soundly (lazy dialect imports + module
+caching make file `touch` coverage incomplete). No optimization implemented; 8991e94 stays the candidate.
