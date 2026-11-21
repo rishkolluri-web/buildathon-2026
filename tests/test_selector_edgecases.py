@@ -55,6 +55,12 @@ class EdgeCases(unittest.TestCase):
                          read("sqlglot/parsers/mysql.py").replace("            options.append(opt)\n", "            options.append(opt) )\n", 1)),
             "hsp": udiff("sqlglot/parsers/spark2.py", read("sqlglot/parsers/spark2.py"),
                          read("sqlglot/parsers/spark2.py").replace("seq_get(args, 0), to=exp.DataType", "seq_get(args, 1), to=exp.DataType", 1)),
+            # import-time metaclass edit redirecting a mutation to a shared object (stress_sa sa1) vs a
+            # value-only flip of the same block's own-class store (sa3): full-suite truth for both
+            "imut": udiff("sqlglot/dialects/dialect.py", read("sqlglot/dialects/dialect.py"),
+                          read("sqlglot/dialects/dialect.py").replace("gen_cls.TRANSFORMS.pop(part, None)", "Generator.TRANSFORMS.pop(part, None)", 1)),
+            "ival": udiff("sqlglot/dialects/dialect.py", read("sqlglot/dialects/dialect.py"),
+                          read("sqlglot/dialects/dialect.py").replace("klass.INITCAP_SUPPORTS_CUSTOM_DELIMITERS = False", "klass.INITCAP_SUPPORTS_CUSTOM_DELIMITERS = True", 1)),
             "hmut": udiff("sqlglot/parsers/spark2.py", read("sqlglot/parsers/spark2.py"),
                           read("sqlglot/parsers/spark2.py").replace("seq_get(args, 0), to=exp.DataType", "seq_get(args, 1), to=exp.DataType", 1)
                           .replace("from sqlglot.parsers.hive import HiveParser\n", "from sqlglot.parsers.hive import HiveParser\n\nexp.Select.EXTRA = 1\n", 1)),
@@ -197,6 +203,15 @@ class EdgeCases(unittest.TestCase):
         self.assertNotIn(self.num("tests/test_parser.py::TestParser::test_max_nodes"), sel)
         self.assertIn(self.num("tests/test_generator.py::TestGenerator::test_generator_memory"), sel)
         self.assertGreater(len(sel), len(self.tests) - 5)
+
+    def test_import_time_mutation_target_change_selects_everything(self):
+        # sa1 truth: 7 failing, 3 of them (test_jsonpath x2, eliminate_subqueries) never import a Trino
+        # dialect alone, but share Generator.TRANSFORMS with one in the same process
+        self.assertEqual(len(self.sel["imut"]), len(self.tests))
+        # sa3 truth: 2 failing, both executing the line in isolation; same targets -> still isolated
+        sel = self.sel["ival"]
+        self.assertLess(len(sel), len(self.tests))
+        self.assertIn(self.num("tests/dialects/test_dialect.py::TestDialect::test_lazy_load"), sel)
 
     def test_import_time_line_uses_isolated_coverage(self):
         # spark2 build_as_cast body runs at import (iso_imp.json.gz): tests whose own isolated run

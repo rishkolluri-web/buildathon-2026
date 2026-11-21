@@ -228,3 +228,28 @@ Diagnosis: 3 official submissions at exactly 174.5 s while the sample improved. 
 - The gain per core ALL is modest: 36.8 → about 27.5 s when test_max_nodes doesn't execute the line. Most tests execute core tokenizer and parser lines anyway.
 - CPU on the sample (bench, 5 runs): 0.430 s (v14) vs 0.430 s.
 - Docker (no-cache amd64, `git archive 4a0f29d`, kit make sample): 101.368 s, 0 misses. Image output on ../stress_iso (as nobody, read-only, no network) is byte-identical to local.
+
+### experiment/iso-mutsig-v16 (base 88ea19c = v15 4a0f29d + log): fail closed when an import-time edit changes mutation targets — uncommitted
+
+- Parallel audit of v15 (cost / safety / runtime investigators):
+  - Runtime: clean. All 6 data files in Dockerfile + gate/bench export lists; image-source subset (250 .py) gives
+    byte-identical selections on 92 patches; 35 missing/corrupt data-file variants never narrower; CPU not worth pursuing.
+  - Cost: the import-channel idea saves 9.4 s on 407 local patches (flip-parser-1960 only): dropped. 127 patches
+    still >= 25 s; floor test_execute_tpcds 25.45 s (fails in 16 of 51 generator-style ones), test_max_nodes fails in 3.
+  - Safety: new corpus ../stress_sa (3 mutants, full-suite truth, base 0 failing):
+    - sa1 dialect.py:355 `gen_cls.TRANSFORMS.pop` -> `Generator.TRANSFORMS.pop`: 7 failing; v15 selects 1363 and
+      MISSES 3 (test_jsonpath x2, test_optimizer::test_eliminate_subqueries); v14 selects ALL. iso_tests had no
+      shared-state guard (tests that never import a Trino dialect alone share Generator.TRANSFORMS with one).
+    - sa2 generators/solr.py adds `SUPPORTED_JSON_PATH_PARTS = set()`: 3 failing, v14 AND v15 select 12 and miss all 3
+      (class rule; the metaclass pops from the inherited base TRANSFORMS). Pre-existing, not fixed here.
+    - sa3 dialect.py:424 False -> True (own-class store): 2 failing, v15 0 missed.
+- Rule: `mutation_sites(tree)` = multiset of store/delete targets, mutating-call receivers, dynamic/registration calls,
+  global/nonlocal (ast.dump, position-free). On an import-time line edit, if old != new -> plain ALL (v14 behaviour;
+  the slow-test line trim has the same blind spot). Value-only edits keep v15's isolated coverage. Unit test
+  `test_import_time_mutation_target_change_selects_everything` (sa1 shape -> ALL, sa3 shape stays narrower).
+- Gate (all 21 corpora incl. stress_sa, --allow-cost-increase): sample 0/30; only mutation miss = sa2 (same miss in
+  4a0f29d and 91c5abd); unit tests 64 OK; fill 0.0 s; narrowed patches verified.
+  vs v15: 5226.5 -> 5235.1 s (+8.6): sa1 28.22 -> 36.82, itb-expressions-core-1379 1554 -> 1620 tests (cost unchanged;
+  its subscript key edit counts as a target change). No other patch changes. vs v14 91c5abd: 5466.1 -> 5235.1 s (-231.0).
+- CPU (bench, sample, 5 runs x 2 interleaved; cloudd busy): v15 0.425/0.430 s, candidate 0.428/0.428 s; sim 101.368 s.
+- Not yet Docker-verified (needs a commit).

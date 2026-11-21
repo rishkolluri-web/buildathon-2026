@@ -67,6 +67,26 @@ def _norm(name):
     return name.lower().replace("_", "")
 
 
+def mutation_sites(tree):
+    """Multiset of what this code can mutate, position-free: targets of attribute/subscript stores and
+    deletes, receivers+names of mutating method calls, dynamic/registration calls, global/nonlocal.
+    Equal for old and new code <=> the edit changed only values flowing into the same targets."""
+    sites = []
+    for n in ast.walk(tree):
+        if isinstance(n, (ast.Global, ast.Nonlocal)):
+            sites.append(ast.dump(n))
+        elif isinstance(n, (ast.Attribute, ast.Subscript)) and isinstance(n.ctx, (ast.Store, ast.Del)):
+            sites.append(ast.dump(n))
+        elif isinstance(n, ast.Call):
+            f = n.func
+            if isinstance(f, ast.Attribute) and (f.attr in _MUTATORS or f.attr.startswith("register")
+                                                 or f.attr in ("import_module", "__import__")):
+                sites.append(ast.dump(f))
+            elif isinstance(f, ast.Name) and (f.id in _DYNAMIC or f.id.startswith("register")):
+                sites.append(ast.dump(f))
+    return sorted(sites)
+
+
 def import_time_mutations(tree, imp_quals, dialect_keys):
     """True if code that runs while this module is imported could change state other modules see:
     stores/deletes into attributes or subscripts, mutating method calls, dynamic setattr/exec...,
@@ -1859,6 +1879,13 @@ class Selector:
                     # runs while sqlglot is imported (metaclass, __init_subclass__,
                     # factories used in class bodies)
                     iso = self.iso_tests(path, r[1])
+                    if iso is not None and "isomut" not in OFF and mutation_sites(old_tree) != mutation_sites(new_tree):
+                        # the edit changes WHAT import-time code mutates (another receiver, a new or removed
+                        # store/mutator call): shared objects reach tests that never execute the line in
+                        # isolation (stress_sa sa1: gen_cls.TRANSFORMS.pop -> Generator.TRANSFORMS.pop)
+                        # (the slow-test line trim has the same blind spot: plain ALL, as v14)
+                        log(f"  {path}: import-time edit changes mutation targets -> all tests")
+                        return ALL
                     if iso is not None:
                         # each test ran alone (collection, runtime, pool children): only a test whose
                         # own run executes the line can see what it computes at import or at runtime
