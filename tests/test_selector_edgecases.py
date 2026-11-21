@@ -54,6 +54,9 @@ class EdgeCases(unittest.TestCase):
             "newf": udiff("sqlglot/brand_new.py", None, "X = 1\n"),
             "ndia": udiff("sqlglot/dialects/myqsl.py", None,
                           "from sqlglot.dialects.dialect import Dialect\n\nclass Myqsl(Dialect):\n    pass\n"),
+            # cross-dialect: parsers/presto.py reads Dialect["teradata"].TIME_MAPPING at runtime
+            "tdtm": udiff("sqlglot/dialects/teradata.py", read("sqlglot/dialects/teradata.py"),
+                          read("sqlglot/dialects/teradata.py").replace('"DD": "%d",', '"DD": "%e",', 1)),
             "nopt": udiff("sqlglot/optimizer/zz_rule.py", None, "def zz_rule(expression):\n    return expression\n"),
             "delf": udiff("sqlglot/dialects/tsql.py", tsql, None),
             "tfil": udiff("tests/test_transpile.py", transpile,
@@ -160,6 +163,20 @@ class EdgeCases(unittest.TestCase):
                 probing |= sel.m.nums(sel.lines_bits(rel, [ln]))
             self.assertTrue(probing and probing <= self.sel[case], case)
             self.assertLess(len(self.sel[case]), len(self.tests), case)
+
+    def test_cross_dialect_time_mapping_selects_consumer(self):
+        # Teradata's TIME_MAPPING is read through the class object by Presto's TO_CHAR
+        # builder; the Presto test fails on this edit (verified on the pinned source)
+        self.assertIn(self.num("tests/dialects/test_presto.py::TestPresto::test_to_char"), self.sel["tdtm"])
+        self.assertLess(len(self.sel["tdtm"]), len(self.tests))
+
+    def test_family_dependents_found_in_source(self):
+        sys.path.insert(0, str(REPO))
+        import selector
+        refs = selector.Selector(selector.Map(selector.MAP, self.tests)).family_dependents()
+        self.assertIn("sqlglot/parsers/presto.py", {r[0] for r in refs["teradata"]})   # runtime lookup
+        self.assertIn("presto", {r[2] for r in refs["mysql"]})                         # import-time copy
+        self.assertIn("presto", {r[2] for r in refs["hive"]})                          # generator reads Hive
 
     def test_nested_conftest_selects_everything(self):
         self.assertEqual(len(self.sel["cftn"]), len(self.tests))

@@ -571,12 +571,78 @@ class Selector:
         base = parts[2][:-3]
         if base in ("__init__", "dialect"):
             return set()
-        mods = {f"sqlglot.{d}.{base}:" for d in self.FAMILY_DIRS}
+        fams, sites = {base}, []
+        if "famdeps" not in OFF:
+            refs = self.family_dependents()
+            work = [base]
+            while work:
+                k = work.pop()
+                for rel, ln, fam in refs.get(k, ()):
+                    if ln in self.m.imp.get(rel, set()):
+                        # import-time reference (class-body copy such as Presto.TIME_MAPPING =
+                        # MySQL.TIME_MAPPING, or a lookup bound at import): the data spreads to
+                        # every user of the referencing family, and on to ITS dependents
+                        if fam and fam not in fams:
+                            fams.add(fam)
+                            work.append(fam)
+                        elif not fam:
+                            sites.append((rel, None))
+                    else:
+                        # runtime reference (Dialect["teradata"] inside a function): only tests
+                        # executing that line read the data; the line runs on every call
+                        sites.append((rel, ln))
+        mods = {f"sqlglot.{d}.{b}:" for d in self.FAMILY_DIRS for b in fams}
         bits = 0
         for cid, idx in self.m.users.items():
             if cid[: cid.index(":") + 1] in mods:
                 bits |= self.m.set(idx)
+        for rel, ln in sites:
+            if ln is None:  # import-time line outside the families: anyone running the file
+                tidx = self.m.touch.get(rel)
+                if tidx is not None:
+                    bits |= self.m.set(tidx)
+            else:
+                bits |= self.lines_bits(rel, [ln])
         return self.m.nums(bits)
+
+    FAM_IMPORT = r"^\s*from\s+sqlglot\.(?:dialects|parsers|generators|tokenizers|typing)\.(\w+)\s+import"
+    REGISTRY = ("sqlglot/dialects/dialect.py", "sqlglot/dialects/__init__.py")
+
+    def family_dependents(self):
+        """Cross-dialect data flow derived from the pinned source:
+        {family: [(file, line, referencing family or None)]}.
+        A dialect family's settings reach other tests without any instance of it:
+        class-object lookups by name (build_formatted_time(..., "teradata") ->
+        Dialect["teradata"].TIME_MAPPING), import-time copies (Presto.TIME_MAPPING =
+        MySQL.TIME_MAPPING) and runtime class reads (Hive.INVERSE_TIME_MAPPING). Every line
+        that imports another family's module or names its dialect key in a string literal
+        is a reference. The registry (Dialects enum, lazy loader) is skipped."""
+        cache = self.__dict__.get("_fam_deps")
+        if cache is None:
+            root = SRC / "sqlglot"
+            keys = sorted(p.stem for p in (root / "dialects").glob("*.py")
+                          if p.stem not in ("__init__", "dialect")) if root.is_dir() else []
+            cache = {}
+            if keys:
+                imp = re.compile(self.FAM_IMPORT)
+                lit = re.compile(r"""(?<![\w.])["'](%s)["']""" % "|".join(keys))
+                for f in sorted(root.rglob("*.py")):
+                    rel = str(f.relative_to(SRC))
+                    if rel in self.REGISTRY:
+                        continue
+                    parts = rel.split("/")
+                    own = f.stem if len(parts) == 3 and parts[1] in self.FAMILY_DIRS else None
+                    try:
+                        text = f.read_text(encoding="utf-8")
+                    except OSError:
+                        continue
+                    for i, line in enumerate(text.split("\n"), 1):
+                        found = {m.group(1) for m in imp.finditer(line)} | {m.group(1) for m in lit.finditer(line)}
+                        for k in found:
+                            if k in keys and k != own:
+                                cache.setdefault(k, []).append((rel, i, own))
+            self._fam_deps = cache
+        return cache
 
     def lines_bits(self, path, lines):
         per = self.m.lines.get(path, {})
