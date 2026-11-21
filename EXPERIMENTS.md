@@ -54,9 +54,13 @@ Targeted full-suite ground truth (../stress_h3, disposable copies, 2 jobs x 4 xd
 | t2 new unreferenced module | 0 | 0 | 0 | 1 |
 | t3 class attr read via class object | 2 | 1543 | 39 | 39 |
 | t4 enum member -> alias | 64 | 1485 | 1485 | 1485 |
-| t5 inherited dict entry | 2 | see gate | | 0 missed |
-| t6 class-level set entry removed | 0 | | | 0 missed |
+| t5 inherited dict entry | 2 | 1381 | | 57, 0 missed |
+| t6 class-level set entry removed | 0 | 1490 | | 5, 0 missed |
 
-Gate vs c003640 with --stress ../stress --stress ../stress_h3: PASS, 0/30 sample, 0/28 mutants missed, total 1083.8 -> 994.5 s (-89.3 s). x_t11_035 (Drill ARRAY_SIZE_NAME; c003640 767 tests, 6b41c7e 12, b702e01 38) full-suite truth with a fresh baseline: running.
+Gate vs c003640 with --stress ../stress --stress ../stress_h3: PASS, 0/30 sample, 0/28 mutants missed, total 1083.8 -> 994.5 s (-89.3 s). x_t11_035 (Drill ARRAY_SIZE_NAME; c003640 767 tests, 6b41c7e 12, b702e01 38): fresh baseline identical to cached base; 2 new failures (test_dialect::test_array, test_postgres::test_array_length), no collection errors; b702e01 selects both.
+
+Final gate vs c003640 with --stress ../stress --stress ../stress_h3 --stress ../stress_x: **PASS**, 0/30 sample, 0/29 mutants missed, unit tests OK (39, incl. PR #2), fill 0.0 s, total 1094.4 -> 1002.1 s (-92.3 s). Patches differing from c003640 (all with truth, 0 missed): t3 36.82->5.10, t6 27.45->2.60, t5 27.61->5.55, s:535z 11.24->2.86, m034 9.03->2.72, x_t11_035 10.69->7.66, t1 0->2.01 (c003640 missed), t2 0->2.01. Selector CPU sample median 0.227 -> 0.241 s.
+
+Docker (b702e01, no-cache linux/amd64, kit make sample): **170.356 s, 0 misses**; output identical to local. (Earlier "170.349" was the local evaluator's per-test ms rounding; official score.py uses float seconds.) Recommended next submission: b702e01, pending team review.
 
 test_execute_tpcds (21.454 s) review: selected through coverage of the changed lines (2haz 2jrq 3utz 66ks, m003 m005 m009 m019 m026 m037 m054 m056), module-name readers (m038 m041), duckdb family (m049), file users (t4), or all-tests escalations. It fails in 4/6 coverage-selected cases with truth (2jrq 3utz m003 m005). The two non-failing sample cases (2haz 66ks, `is` -> `==`) are equivalent only given runtime types without __eq__ overrides, not provable from the source -> kept. Packing: 114 patches, pack 1002.112 s vs lower bound 1002.111 s -> no packing gain.
