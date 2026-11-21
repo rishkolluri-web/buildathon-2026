@@ -130,3 +130,10 @@ One rule vs aa103eb: cross-dialect propagation is attribute-level. A reference t
 - Narrowing truth (../stress_w): w1 MySQL SAFE_TO_ELIMINATE_DOUBLE_NEGATION 1 failing, v7 selects 7 tests, 0 missed (aa103eb 652, c003640 1096). w2-w6 pending (truth runs stalled by iCloud eviction of ../.venv313; re-downloading).
 - Regression tests: Teradata->Presto test_to_char; MySQL mapping -> test_hive::test_time, Presto test_to_char/test_time, SingleStore, T-SQL; Hive mapping -> Presto/Spark/T-SQL. Unit tests OK.
 - CPU (loaded machine): sample c003640 0.214 / aa103eb 0.322 / v7 0.440 s.
+
+#### attrdeps-v7 final validation (candidate 8238fd692c02fc764e953ae4a15706a64e6c01d8)
+
+- Narrowing truth (../stress_w), all 0 missed: w1 1 failing (7 sel vs aa103eb 652), w2 1 (12 vs 685), w3 1 (41 vs 1171), w4 7 (76 vs 1304), w5 10 (50 vs 59), w6 TSQL CONVERT_FORMAT_MAPPING 0 (2 vs 2). No collection errors. (w2-w5 ran during iCloud eviction of ../.venv313; slowness can only add failures, never hide them.)
+- Gate, sample + 7 corpora (stress, h3, x, u, v, c, w; 56 truth mutants): vs c003640 PASS (total 1437.5 -> 1301.7, -135.8 s); vs aa103eb PASS (1383.7 -> 1301.7, -82.0 s); 0/30 sample, 0/56 mutants, fill 0.0 s, all narrowed patches verified. Unit tests OK.
+- Docker (exact 8238fd6, no-cache amd64, make sample): 170.349 s, 0 misses, run 2.3 s, protocol OK.
+- Recommended next submission: 8238fd6 (pending team review). c003640 stays the final pick unless this beats 190.8 s officially.
