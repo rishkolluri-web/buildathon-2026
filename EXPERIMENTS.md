@@ -253,3 +253,11 @@ Diagnosis: 3 official submissions at exactly 174.5 s while the sample improved. 
   its subscript key edit counts as a target change). No other patch changes. vs v14 91c5abd: 5466.1 -> 5235.1 s (-231.0).
 - CPU (bench, sample, 5 runs x 2 interleaved; cloudd busy): v15 0.425/0.430 s, candidate 0.428/0.428 s; sim 101.368 s.
 - Docker (no-cache amd64, `git archive f84987c`, kit make -o build sample): 101.368 s, 0 misses. Image run with the kit RUN_FLAGS (uid 65534, read-only, no network) on ../stress_sa: byte-identical to local output.
+
+### Official BB-9E4A99AD (f84987c, v16 = v15 + mutation-target guard): 172.2 s, 0 misses
+
+- Runs: 171.078 / 171.078 / 171.078 s simulated, CPU 1.08 / 1.09 / 1.08 s, 0 commits missed. Identical to v14
+  (91c5abd, BB-A7FC9370) to the millisecond.
+- Reading: no hidden commit's busiest-worker load changed between v14 and v16, so the hidden set has no import-time
+  function-body edit that v15's isolated coverage narrows enough to drop a slow test (or none at all). The remaining
+  hidden excess over the sample (~70 s) is not reached by the v15/v16 rules.
