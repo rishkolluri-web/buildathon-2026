@@ -782,7 +782,7 @@ class Selector:
         log(f"  {path}: class dict value change at {ov.lineno} entries {changed} -> {len(out)} reading tests")
         return out
 
-    STATIC = ("_fam_deps", "_derived", "_non_data", "_imp_uses")
+    STATIC = ("_fam_deps", "_derived", "_non_data", "_imp_uses", "_test_importers")
 
     def load_static_index(self):
         import pickle
@@ -810,6 +810,8 @@ class Selector:
             keys |= {p.stem for p in (SRC / "sqlglot" / d).glob("*.py")}
         for k in sorted(keys):
             self.non_data_names(k)
+        if self.test_importers() is ALL:  # never ship a sentinel: recompute lazily (-> ALL) at run time
+            raise SystemExit("test import graph unresolved at the pinned commit")
         idx = {k: self.__dict__[k] for k in self.STATIC}
         idx["src"] = str(SRC)
         with open(out, "wb") as f:
@@ -1266,11 +1268,161 @@ class Selector:
     def file_tests(self, path):
         return self.m.by_file.get(path, set())
 
+    def test_importers(self):
+        """{tests/x.py: set of test modules that import it, directly or transitively} from the pinned
+        test sources (import / from-import / relative / sibling, anywhere in the file), or ALL when an
+        import that names the tests package cannot be resolved to a file."""
+        cache = self.__dict__.get("_test_importers")
+        if cache is not None:
+            return cache
+        root = SRC / "tests"
+        files = sorted(str(f.relative_to(SRC)) for f in root.rglob("*.py")) if root.is_dir() else []
+        known = set(files)
+        direct = {}
+        unresolved = False
+
+        def resolve(dotted, rel):
+            parts = dotted.split(".") if dotted else []
+            cands = []
+            if parts and parts[0] == "tests":
+                cands.append("/".join(parts))
+            elif parts and f"{'/'.join(rel.split('/')[:-1])}/__init__.py" not in known:
+                # importing file's directory is not a package: pytest puts it on sys.path (rootdir
+                # "prepend" mode), so a bare name may be a sibling module
+                cands.append("/".join(rel.split("/")[:-1] + parts))
+            for c in cands:
+                for f in (c + ".py", c + "/__init__.py"):
+                    if f in known:
+                        return f
+            return None
+
+        def mod_of(n):
+            if isinstance(n, ast.ImportFrom):
+                if n.level:
+                    base = pkg[: len(pkg) - (n.level - 1)] if n.level > 1 else pkg
+                    return ".".join(base + ([n.module] if n.module else []))
+                return n.module or ""
+            return None
+
+        for rel in files:
+            try:
+                tree = ast.parse((SRC / rel).read_text(encoding="utf-8"))
+            except (OSError, SyntaxError):
+                unresolved = True
+                continue
+            pkg = rel.split("/")[:-1]
+            for n in ast.walk(tree):
+                names = []
+                if isinstance(n, ast.Import):
+                    names = [a.name for a in n.names]
+                elif isinstance(n, ast.ImportFrom):
+                    mod = mod_of(n)
+                    names = [mod] + [f"{mod}.{a.name}" for a in n.names if a.name != "*"]
+                for dotted in names:
+                    f = resolve(dotted, rel)
+                    if f is not None:
+                        if f != rel:
+                            direct.setdefault(f, set()).add(rel)
+                    elif (dotted == "tests" or dotted.startswith("tests.")) and dotted != mod_of(n) \
+                            and resolve(dotted.rsplit(".", 1)[0], rel) is not None:
+                        pass  # `from tests.x import name`: name is an attribute of tests/x.py (resolved above)
+                    elif dotted == "tests" or dotted.startswith("tests."):
+                        unresolved = True  # names the tests package but no file: cannot bound it
+        if unresolved:
+            self._test_importers = ALL
+            return ALL
+        closure = {}
+        for f in known:
+            seen, work = set(), [f]
+            while work:
+                g = work.pop()
+                for h in direct.get(g, ()):
+                    if h not in seen:
+                        seen.add(h)
+                        work.append(h)
+            closure[f] = seen
+        self._test_importers = closure
+        return closure
+
+    def test_import_time_users(self, path, tree, lines, kind):
+        imp = self.test_importers()
+        if imp is ALL:
+            return ALL
+        uses, enclosing = self.test_import_refs(tree, lines)
+        if kind == "lambda" or enclosing & uses:
+            return self.test_module_tests(path)
+        out = set()
+        for g in imp.get(path, ()):
+            t2 = self.pinned_tree(g) if hasattr(self, "pinned_tree") else None
+            if t2 is None:
+                try:
+                    t2 = ast.parse((SRC / g).read_text(encoding="utf-8"))
+                except (OSError, SyntaxError):
+                    return ALL
+            if enclosing & self.test_import_refs(t2, ())[0]:
+                r = self.test_module_tests(g)
+                if r is ALL:
+                    return ALL
+                out |= r
+        return out
+
+    @staticmethod
+    def test_import_refs(tree, lines):
+        """(names used by code that runs at import of this module, names of functions enclosing `lines`)."""
+        """Do the changed lines of a test module possibly run while it is imported? Lambdas at module/
+        class level: yes (conservative). Function bodies: if the enclosing function's name is used by
+        code that runs at import (module statements, class bodies, decorators, defaults, bases)."""
+        imp_names = set()
+        enclosing = set()
+
+        def names(node):
+            for x in ast.walk(node):
+                if isinstance(x, ast.Name):
+                    imp_names.add(x.id)
+                elif isinstance(x, ast.Attribute):
+                    imp_names.add(x.attr)
+
+        def visit(body, in_func):
+            for st in body:
+                if isinstance(st, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    if any(first_line(st) <= ln <= st.end_lineno for ln in lines):
+                        enclosing.add(st.name)
+                    if not in_func:
+                        for d in st.decorator_list + st.args.defaults + [d for d in st.args.kw_defaults if d]:
+                            names(d)
+                    visit(st.body, True)
+                elif isinstance(st, ast.ClassDef):
+                    if not in_func:
+                        for e in st.bases + [k.value for k in st.keywords] + st.decorator_list:
+                            names(e)
+                    visit(st.body, in_func)
+                elif not in_func:
+                    names(st)
+                    for f in BODY_FIELDS:
+                        visit(getattr(st, f, None) or [], in_func)
+
+        visit(tree.body, False)
+        return imp_names, enclosing
+
+    def test_module_tests(self, path):
+        """Tests of a test module AND of every test module importing it (an error while importing it
+        breaks their collection too). ALL if the import graph is not reliable."""
+        imp = self.test_importers()
+        if imp is ALL:
+            log(f"  {path}: test import graph unresolved -> all tests")
+            return ALL
+        out = set(self.file_tests(path))
+        for f in imp.get(path, ()):
+            out |= self.file_tests(f)
+        if imp.get(path):
+            log(f"  {path}: imported by {len(imp[path])} test module(s) -> {len(out)} tests")
+        return out
+
     def py_change(self, path, old_text, deleted, hunks):
         """-> (set of numbers) or ALL"""
         is_test_file = path.startswith("tests/")
         if deleted:  # deleted module
-            return ALL if not is_test_file or "helpers" in path else self.file_tests(path)
+            return ALL if not is_test_file or "helpers" in path else self.test_module_tests(path)
         if old_text is None:
             # brand-new file: nothing imports it by name at the pinned commit, but tests
             # that enumerate packages/directories (pkgutil.iter_modules, listdir, glob...)
@@ -1302,7 +1454,7 @@ class Selector:
             new_tree = ast.parse("\n".join(new_lines))
         except SyntaxError:
             log(f"  {path}: syntax error after patch -> import breaks")
-            return ALL if not path.startswith("tests/test_") and not path.startswith("tests/dialects/test_") else self.file_tests(path)
+            return ALL if not path.startswith("tests/test_") and not path.startswith("tests/dialects/test_") else self.test_module_tests(path)
         old_tree = ast.parse(old_text)
         if self.sole and not is_test_file and self.eq_safe and swap_only_hunks(hunks):
             sites = swap_only_sites(old_tree, new_tree, old_touched | new_touched)
@@ -1347,6 +1499,14 @@ class Selector:
                 self.related |= self.m.nums(self.m.set(tidx))
             self.related |= self.family_users(path)
         for r in d.regions:
+            if r[0] in ("lines", "lambda") and is_test_file:
+                # code of a test module that runs while some test module is imported (called from its
+                # own module/class level, or from the import-time code of a module importing it): the
+                # effect reaches every test module importing that one
+                t = self.test_import_time_users(path, old_tree, r[1], r[0])
+                if t is ALL:
+                    return ALL
+                out |= t
             if r[0] == "lines":
                 hit = import_time(r[1]) if not is_test_file else None
                 if hit:
@@ -1404,11 +1564,17 @@ class Selector:
                         log(f"  {path}: class {r[1]} has no known users -> all tests")
                         return ALL
                 if is_test_file:
-                    users |= self.file_tests(path)
+                    t = self.test_module_tests(path)  # e.g. a base TestCase subclassed elsewhere
+                    if t is ALL:
+                        return ALL
+                    users |= t
                 out |= users
             else:  # module-level change
                 if path.startswith("tests/test_") or path.startswith("tests/dialects/test_"):
-                    out |= self.file_tests(path)
+                    t = self.test_module_tests(path)  # runs at import of every importing test module
+                    if t is ALL:
+                        return ALL
+                    out |= t
                     continue
                 r2 = self.module_change(path, r[1] if len(r) > 1 else None, r[2] if len(r) > 2 else None)
                 if r2 is ALL:

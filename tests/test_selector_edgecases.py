@@ -100,6 +100,16 @@ class EdgeCases(unittest.TestCase):
                            .replace('return self.func("dateTrunc", unit,', 'return self.func("dateTrunX", unit,', 1)),
             "opeq": udiff("sqlglot/parsers/dremio.py", read("sqlglot/parsers/dremio.py"),
                           read("sqlglot/parsers/dremio.py").replace("        if len(args) == 2:\n", "        if len(args) != 2:\n", 1)),
+            # test-module dependencies: a test module imported by other test modules
+            "tdep": udiff("tests/dialects/test_dialect.py", read("tests/dialects/test_dialect.py"),
+                          read("tests/dialects/test_dialect.py").replace(
+                              "_PARSER_IS_COMPILED = is_compiled(_base_module)\n", "_PARSER_IS_COMPILED = is_compiled(_base_modulex)\n", 1)),
+            "thlp": udiff("tests/helpers.py", helpers, helpers.replace(
+                '    return not getattr(module, "__file__", ".py").endswith(".py")',
+                '    return getattr(module, "__file__", ".py").endswith(".py")', 1)),
+            "tloc": udiff("tests/test_parser.py", read("tests/test_parser.py"), read("tests/test_parser.py").replace(
+                'parse_one("SELECT * FROM (SELECT 1) UNION SELECT 2"), exp.Union)',
+                'parse_one("SELECT * FROM (SELECT 1) UNION SELECT 2"), exp.Intersect)', 1)),
             "nopt": udiff("sqlglot/optimizer/zz_rule.py", None, "def zz_rule(expression):\n    return expression\n"),
             "delf": udiff("sqlglot/dialects/tsql.py", tsql, None),
             "tfil": udiff("tests/test_transpile.py", transpile,
@@ -303,6 +313,21 @@ class EdgeCases(unittest.TestCase):
         self.assertGreater(len(self.sel["opmix"]), 0)  # an extra edit in the file: normal coverage
         self.assertGreater(len(self.sel["opeq"]), 0)  # == -> != is not a traced relational site
         self.assertIn("comparison operator change", self.stderr)
+
+    def test_test_module_change_selects_importing_test_modules(self):
+        # Person 1 audit: an import error in tests/dialects/test_dialect.py breaks collection of
+        # every dialect test module importing Validator from it
+        importers = {t["number"] for t in self.tests if t["file"].startswith("tests/dialects/test_")
+                     and t["file"] != "tests/dialects/test_dialect.py"}
+        self.assertTrue(len(importers) > 500 and importers <= self.sel["tdep"])
+
+    def test_helper_called_at_import_by_importer(self):
+        # helpers.is_compiled runs at import of test_dialect (module level) -> its importers too
+        nums = {t["number"] for t in self.tests if t["file"] == "tests/dialects/test_bigquery.py"}
+        self.assertTrue(nums and nums <= self.sel["thlp"])
+
+    def test_isolated_test_body_stays_local(self):
+        self.assertLess(len(self.sel["tloc"]), 20)
 
     def test_static_index_changes_nothing(self):
         self.assertEqual(self.raw_idx, self.raw)  # build-time index == lazy computation
