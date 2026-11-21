@@ -160,6 +160,12 @@ class EdgeCases(unittest.TestCase):
             "cftn": udiff("tests/dialects/conftest.py", None, "import pytest\n"),
             "junk": "this is not a diff\n@@ nonsense @@\n+++\n",
             "empt": "",
+            # plain unified diff (no `diff --git` header) and a patch whose context does not match the pinned file
+            "pldf": "".join(difflib.unified_diff(scope.splitlines(keepends=True),
+                                                 scope.replace("def traverse_scope(", "def traverse_scope((", 1).splitlines(keepends=True),
+                                                 "a/sqlglot/optimizer/scope.py", "b/sqlglot/optimizer/scope.py")),
+            "stal": udiff("sqlglot/helper.py", helper.replace("\nlogger = ", "\nlogger  = ", 1),
+                          helper.replace("\nlogger = ", "\nUNUSED_CONST = 3\nlogger  = ", 1)),
         }
         for k, v in cls.patches.items():
             if k not in ("junk", "empt", "rdme", "conf", "fxnw", "sqgc", "cftn"):
@@ -201,6 +207,11 @@ class EdgeCases(unittest.TestCase):
 
     def test_protocol_valid(self):
         self.assertEqual(self.errors, [])
+
+    def test_unparseable_or_stale_patches_fail_closed(self):
+        self.assertEqual(len(self.sel["pldf"]), len(self.tests))  # was 0 tests before v19
+        self.assertEqual(len(self.sel["stal"]), len(self.tests))  # context not in the pinned file
+        self.assertEqual(self.sel["empt"], set())
 
     def test_syntax_error_selects_everything(self):
         self.assertEqual(len(self.sel["synt"]), len(self.tests))
@@ -434,6 +445,45 @@ class EdgeCases(unittest.TestCase):
         self.assertGreater(len(names), 100)
         for n in names:
             self.assertEqual(sel2.test_files_mentioning(n), lazy[n], n)
+
+
+class PatchReconstruction(unittest.TestCase):
+    """apply_hunks must agree with git apply: offsets, -U0 insertions, and fail closed on unknown context."""
+
+    def setUp(self):
+        sys.path.insert(0, str(REPO))
+        import selector
+        self.S = selector
+        self.old = [f"line{i}" for i in range(1, 41)]
+
+    def apply(self, patch):
+        f = self.S.parse_patch(patch)[0]
+        return self.S.apply_hunks(list(self.old), f["hunks"])[0]
+
+    def patch(self, new, n=3, shift=0):
+        body = "".join(difflib.unified_diff([x + "\n" for x in self.old], [x + "\n" for x in new], "a/f.py", "b/f.py", n=n))
+        if shift:
+            import re
+            body = re.sub(r"@@ -(\d+)", lambda m: f"@@ -{int(m.group(1)) + shift}", body)
+        return "diff --git a/f.py b/f.py\n" + body
+
+    def test_offset_hunk_matches_unshifted(self):
+        new = list(self.old)
+        new[20] = "changed"
+        want = self.apply(self.patch(new))
+        self.assertEqual(want[20], "changed")
+        for shift in (-5, -1, 2, 7):
+            self.assertEqual(self.apply(self.patch(new, shift=shift)), want, shift)
+
+    def test_zero_context_insertion_lands_after_its_line(self):
+        new = self.old[:6] + ["inserted"] + self.old[6:]
+        self.assertEqual(self.apply(self.patch(new, n=0)), self.apply(self.patch(new)))
+        self.assertEqual(self.apply(self.patch(new, n=0))[6], "inserted")
+
+    def test_unknown_context_raises(self):
+        p = self.patch([*self.old[:20], "changed", *self.old[21:]]).replace(" line19\n", " lineXX\n", 1)
+        with self.assertRaises(self.S.PatchMismatch):
+            self.apply(p)
 
 
 class ConstLeafDiff(unittest.TestCase):

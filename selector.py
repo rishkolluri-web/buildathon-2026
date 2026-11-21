@@ -294,7 +294,10 @@ def parse_patch(text):
     files = []
     cur = None
     hunk = None
-    for line in text.split("\n"):
+    lines = text.split("\n")
+    if lines and lines[-1] == "":
+        lines.pop()  # the patch text's own final newline, not an empty context line (misplaced -U0 insertions)
+    for line in lines:
         if line.startswith("diff --git "):
             m = re.match(r"diff --git a/(.*?) b/(.*)$", line)
             cur = {"old": m.group(1) if m else None, "new": m.group(2) if m else None, "hunks": [], "binary": False}
@@ -325,8 +328,13 @@ def parse_patch(text):
     return files
 
 
+class PatchMismatch(ValueError):
+    """A hunk's context/removed lines do not match the pinned source: the patch was made against other code."""
+
+
 def apply_hunks(old_lines, hunks):
-    """old_lines: list without newlines. Returns (new_lines, old_touched, new_touched)."""
+    """old_lines: list without newlines. Returns (new_lines, old_touched, new_touched). Context and removed
+    lines must match the pinned source (as git apply requires); otherwise PatchMismatch (-> every test)."""
     new = []
     pos = 0  # index into old_lines
     old_touched, new_touched = set(), set()
@@ -334,10 +342,28 @@ def apply_hunks(old_lines, hunks):
         # trim trailing phantom context produced by the final newline split
         while body and body[-1] == (" ", "") and (start - 1 + sum(1 for t, _ in body if t != "+")) > len(old_lines):
             body.pop()
-        s = max(start - 1, 0) if any(t != "+" for t, _ in body) else start
+        block = [txt for t, txt in body if t != "+"]
+        s = max(start - 1, 0) if block else start
+        if block and old_lines[s:s + len(block)] != block:
+            # like git apply: the hunk may sit at an offset from its header's line numbers (patch made against
+            # a shifted version of the file); take the nearest exact context match after the previous hunk
+            for off in range(1, len(old_lines) + 1):
+                cand = [c for c in (s - off, s + off) if pos <= c <= len(old_lines) - len(block)]
+                hit = next((c for c in cand if old_lines[c:c + len(block)] == block), None)
+                if hit is not None:
+                    s = hit
+                    break
+                if s - off < pos and s + off > len(old_lines) - len(block):
+                    break
+            else:
+                raise PatchMismatch(f"hunk @{start}: context not found")
+            if old_lines[s:s + len(block)] != block:
+                raise PatchMismatch(f"hunk @{start}: context not found")
         new.extend(old_lines[pos:s])
         pos = s
         for tag, txt in body:
+            if tag != "+" and (old_lines[pos] != txt if pos < len(old_lines) else (tag == "-" or txt != "")):
+                raise PatchMismatch(f"line {pos + 1}: {txt[:60]!r}")
             if tag == " ":
                 old_touched.add(pos + 1)
                 new.append(old_lines[pos] if pos < len(old_lines) else txt)
@@ -2143,7 +2169,9 @@ class Selector:
         self.related = set()
         files = parse_patch(patch_text)
         if not files:
-            return set()
+            # no `diff --git` sections: empty patch -> nothing; a plain unified diff or anything else with diff
+            # markers would otherwise be silently ignored -> fail closed
+            return ALL if re.search(r"^(@@ |\+\+\+ |--- )", patch_text, re.M) else set()
         chosen = set()
         trim = []  # sqlglot modules whose in-place edit alone forces ALL
         self.trim_lines = []  # (path, lines): import-time function-body lines (ALL unless trimmed)
