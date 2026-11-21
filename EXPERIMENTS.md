@@ -31,3 +31,11 @@ Perfect-knowledge oracle on the 30 sample commits: **94.4 s**.
 | — | m042 / m048 (0 tests selected) code review | reviewed | | | | | m042: lineage logger used only at lineage.py:342, executed by no test. m048: stub rebound by later defs; no test reads overloads/annotations/signatures (test_sqlglotc mocks mypyc). Ground truth queued next |
 | 2026-11-20 | **c003640 (official submission BB-7C706349, experiment/autoloop)** | 178.7 (sample, Docker) | 0 (sample) | 0.97–1.00 s (server) | **190.8** | **0** | VALID, scored; entered in final | V3 narrowing + iter 1 + module_change hole fix | KEEP (new best) | practice simulated 189.804 s vs 339.238 s for a6ee059 (−149.4 s); 3 identical runs |
 
+## experiment/perf-v5 (base c003640 = official 190.8 s)
+
+Baseline c003640 on 77 mutants: 785.7 s, 8 all-test escalations = 294.5 s (37 %): 6 import-time lines (m014 m016 m021 m050 m051 m052), removed import (m066), syntax error (m068). Ground truth 19/77; m042 and m048 now verified (0 failing; c003640 selects 0).
+
+| Iter | Rule | Gate vs c003640 | Sample | Mutants | Δ | Patches changed (removed tests, truth) |
+|---|---|---|---|---|---|---|
+| 1 | H3: class-level data whose attributes are never read at import -> class/family users ∩ runtime readers of the attribute | PASS (19 truth) | 178.7→170.3 | 785.7→778.7 | −15.4 s | s:535z 11.24→2.85 (−221 tests; failing test_simplify kept); m:m034 9.03→2.04 (−24 tests; truth 0 failing) |
+

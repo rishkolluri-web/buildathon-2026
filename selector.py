@@ -35,7 +35,7 @@ MAX_WORKERS = 8
 GLOBAL_CONFIG = {"pyproject.toml", "setup.cfg", "tox.ini", "pytest.ini", "conftest.py", "tests/conftest.py"}
 ALL = object()  # sentinel: select every test
 # Ablation switches for measuring each safety rule (never set in the image):
-# BR_OFF=imp,hdrimp,refs,family,classhdr,fixdir,fill
+# BR_OFF=imp,hdrimp,refs,classread,family,classhdr,argshdr,fixdir,fill
 OFF = set(filter(None, os.environ.get("BR_OFF", "").split(",")))
 
 
@@ -257,7 +257,7 @@ class Differ:
             elif ctx[0] == "class":
                 for o in removed:
                     self.regions.append(("lines", span(o)))
-                self.regions.append(("class", ctx[1]))
+                self.regions.append(("class", ctx[1], list(removed) + list(added)))
             else:
                 self.regions.append(("module", list(removed), list(added)))
 
@@ -325,7 +325,7 @@ class Differ:
 
     def unit_change(self, o, ctx, n=None):
         if ctx[0] == "class":
-            self.regions.append(("class", ctx[1]))
+            self.regions.append(("class", ctx[1], [o, n] if n is not None else None))
         elif ctx[0] == "func":
             self.regions.append(("lines", span(o)))
         else:
@@ -480,6 +480,31 @@ class Selector:
                 out |= r
         return out
 
+    def class_data_readers(self, path, stmts, is_test_file):
+        """Tests that execute a runtime read of the class attributes bound by `stmts`,
+        or None when that is not a safe bound (import-time reads, non-data statements,
+        private/dunder or method-like names, unknown statements)."""
+        if "classread" in OFF or is_test_file or not stmts or not self.m.refs:
+            return None
+        names = set()
+        for st in stmts:
+            if not isinstance(st, (ast.Assign, ast.AnnAssign)):
+                return None
+            b = bound_names(st)
+            if not b or "__complex_target__" in b:
+                return None
+            names |= b
+        out = set()
+        for nm in names:
+            if nm.startswith("__") or nm.endswith("_sql") or nm.startswith("_parse"):
+                return None  # reached through generic dispatch (dir()/getattr f-strings)
+            e = self.m.refs.get(nm, {})
+            if e.get("impa") or e.get("impn"):
+                return None  # read while classes/modules are built: derived state
+            for idx in e.get("rta", {}).values():
+                out |= self.m.nums(self.m.set(idx))
+        return out
+
     def import_ctx_users(self, ctx, depth, work):
         kind, g = ctx[0], ctx[1]
         if kind == "class":
@@ -586,6 +611,12 @@ class Selector:
                 # dialect metaclasses copy tokenizer/parser/generator settings across the
                 # family at import, so any class of the family can carry the change
                 users |= self.family_users(path)
+                readers = self.class_data_readers(path, r[2] if len(r) > 2 else None, is_test_file)
+                if readers is not None and users:
+                    # only tests that both use the class (family) and execute a read of
+                    # the changed attribute can observe the change
+                    out |= users & readers
+                    continue
                 if not users:
                     # never instantiated (enum, namespace, mixin...): fall back to file users
                     tidx = self.m.touch.get(path)
