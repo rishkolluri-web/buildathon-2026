@@ -140,9 +140,13 @@ def main():
     shutil.copy(kit / "sample" / "tests.json", mdata / "tests.json")
     basedir = tmp / "base"
     basedir.mkdir()
-    for f in ("selector.py", "map.json.gz"):
-        blob = subprocess.run(["git", "show", f"{a.base}:{f}"], cwd=REPO, capture_output=True, check=True).stdout
-        (basedir / f).write_bytes(blob)
+    for f in ("selector.py", "map.json.gz", "eqsites.json"):
+        p = subprocess.run(["git", "show", f"{a.base}:{f}"], cwd=REPO, capture_output=True)
+        if p.returncode:
+            if f == "eqsites.json":  # absent before typecheck-v8
+                continue
+            raise SystemExit(f"git show {a.base}:{f} failed")
+        (basedir / f).write_bytes(p.stdout)
 
     cand = evaluate(a.python, str(REPO / "selector.py"), REPO / "map.json.gz", a.src, kit, mdata, ms)
     base = evaluate(a.python, str(basedir / "selector.py"), basedir / "map.json.gz", a.src, kit, mdata, ms)

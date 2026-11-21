@@ -188,15 +188,17 @@ def enum_like_classes(tree):
                 walk(st.body, q + ".")
 
     walk(tree.body, "")
+    bases_of = {q: [b.id if isinstance(b, ast.Name) else b.attr if isinstance(b, ast.Attribute) else "" for b in st.bases]
+                for q, st in defs.items()}
+    auto = {q: any(isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and n.func.id == "auto" for n in ast.walk(st))
+            for q, st in defs.items()}  # computed once per class, not once per fixpoint round
     changed = True
     while changed:
         changed = False
-        for q, st in defs.items():
+        for q in defs:
             if q in out:
                 continue
-            bases = [b.id if isinstance(b, ast.Name) else b.attr if isinstance(b, ast.Attribute) else "" for b in st.bases]
-            uses_auto = any(isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and n.func.id == "auto" for n in ast.walk(st))
-            if uses_auto or any(b.endswith(ENUM_BASES) or b in out for b in bases):
+            if auto[q] or any(b.endswith(ENUM_BASES) or b in out for b in bases_of[q]):
                 out.add(q)
                 changed = True
     return out
@@ -429,14 +431,6 @@ def module_name(path):
 _SWAPS = ({ast.Is, ast.Eq}, {ast.IsNot, ast.NotEq})
 
 
-class _NormOps(ast.NodeTransformer):
-    def visit_Compare(self, node):
-        self.generic_visit(node)
-        node.ops = [ast.Eq() if isinstance(o, ast.Is) else ast.NotEq() if isinstance(o, ast.IsNot) else o
-                    for o in node.ops]
-        return node
-
-
 _SWAP_NORM = re.compile(r"\bis\s+not\b|!=|\bis\b|==")
 
 
@@ -452,20 +446,44 @@ def swap_only_hunks(hunks):
     return True
 
 
-def swap_only_sites(old_tree, new_tree):
+def swap_only_sites(old_tree, new_tree, touched=None):
     """["line:col", ...] of single-operator comparisons whose operator is swapped between
-    is/== or is not/!=, if that is the ONLY difference between the two trees; else None."""
-    import copy
+    is/== or is not/!=, if that is the ONLY difference between the two trees; else None.
 
-    a, b = _NormOps().visit(copy.deepcopy(old_tree)), _NormOps().visit(copy.deepcopy(new_tree))
-    if ast.dump(a) != ast.dump(b):
-        return None
+    One parallel walk over both trees (no copies). `touched`: lines a hunk touched in either
+    version; only valid when every hunk removes as many lines as it adds (swap_only_hunks),
+    so line numbers coincide. A statement at the same position in both trees whose lines
+    are all untouched has identical source text, hence an identical subtree: skipped."""
     sites = []
-    for x, y in zip(ast.walk(old_tree), ast.walk(new_tree)):
-        if isinstance(x, ast.Compare) and [type(o) for o in x.ops] != [type(o) for o in y.ops]:
-            if len(x.ops) != 1 or {type(x.ops[0]), type(y.ops[0])} not in _SWAPS:
-                return None
-            sites.append(f"{x.lineno}:{x.col_offset}")
+    skip_ok = touched is not None
+
+    def same(a, b):
+        if type(a) is not type(b):
+            return False
+        if isinstance(a, ast.AST):
+            if skip_ok and isinstance(a, ast.stmt):
+                s = first_line(a)
+                if (s == first_line(b) and a.end_lineno == b.end_lineno and a.col_offset == b.col_offset
+                        and a.end_col_offset == b.end_col_offset
+                        and not any(s <= ln <= a.end_lineno for ln in touched)):
+                    return True
+            if isinstance(a, ast.Compare):
+                ta, tb = [type(o) for o in a.ops], [type(o) for o in b.ops]
+                if ta != tb:
+                    if len(ta) != 1 or len(tb) != 1 or {ta[0], tb[0]} not in _SWAPS:
+                        return False
+                    sites.append(f"{a.lineno}:{a.col_offset}")
+                return same(a.left, b.left) and same(a.comparators, b.comparators)
+            for f in a._fields:
+                if not same(getattr(a, f, None), getattr(b, f, None)):
+                    return False
+            return True
+        if isinstance(a, list):
+            return len(a) == len(b) and all(same(x, y) for x, y in zip(a, b))
+        return a == b
+
+    if not same(old_tree, new_tree):
+        return None
     return sites or None
 
 
@@ -962,7 +980,7 @@ class Selector:
             return ALL if not path.startswith("tests/test_") and not path.startswith("tests/dialects/test_") else self.file_tests(path)
         old_tree = ast.parse(old_text)
         if self.sole and not is_test_file and self.eq_safe and swap_only_hunks(hunks):
-            sites = swap_only_sites(old_tree, new_tree)
+            sites = swap_only_sites(old_tree, new_tree, old_touched | new_touched)
             if sites and all(f"{path}:{site}" in self.eq_safe for site in sites):
                 # the patch only swaps is<->== / is not<->!= where every traced execution compared
                 # operands for which identity and equality agree by construction: every
@@ -986,7 +1004,7 @@ class Selector:
         d.body(old_tree.body, new_tree.body, ("module", None), None)
         out = set()
         mod = module_name(path)
-        enum_like = enum_like_classes(old_tree)
+        enum_like = None  # computed on the first class-level region only
         if d.regions:
             tidx = self.m.touch.get(path)
             if tidx is not None:
@@ -1015,6 +1033,8 @@ class Selector:
                     if not attrs or "__complex_target__" in attrs:
                         attrs = None
                 users |= self.family_users(path, attrs)
+                if enum_like is None:
+                    enum_like = enum_like_classes(old_tree)
                 readers = None if r[1] in enum_like else \
                     self.class_data_readers(path, r[2] if len(r) > 2 else None, is_test_file)
                 if readers is not None:
