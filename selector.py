@@ -169,6 +169,38 @@ def first_line(node):
     return min([node.lineno] + [d.lineno for d in decs])
 
 
+ENUM_BASES = ("Enum", "Flag", "AutoName")
+
+
+def enum_like_classes(tree):
+    """Qualified names of classes that are (or derive, within this file, from) enums.
+    Enum member values interact (aliases, auto() numbering), so a member change can be
+    observed through reads of OTHER members."""
+    out = set()
+    defs = {}
+
+    def walk(body, prefix):
+        for st in body:
+            if isinstance(st, ast.ClassDef):
+                q = prefix + st.name
+                defs[q] = st
+                walk(st.body, q + ".")
+
+    walk(tree.body, "")
+    changed = True
+    while changed:
+        changed = False
+        for q, st in defs.items():
+            if q in out:
+                continue
+            bases = [b.id if isinstance(b, ast.Name) else b.attr if isinstance(b, ast.Attribute) else "" for b in st.bases]
+            uses_auto = any(isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and n.func.id == "auto" for n in ast.walk(st))
+            if uses_auto or any(b.endswith(ENUM_BASES) or b in out for b in bases):
+                out.add(q)
+                changed = True
+    return out
+
+
 def is_stub(fn):
     return all(
         isinstance(b, ast.Pass)
@@ -555,6 +587,23 @@ class Selector:
                 b |= self.m.set(idx)
         return b
 
+    ENUMERATORS = ("iter_modules", "walk_packages", "listdir", "scandir", "glob(", "iterdir")
+
+    def package_enumerator_tests(self):
+        cache = self.__dict__.get("_enum_tests")
+        if cache is None:
+            cache = set()
+            tests_dir = SRC / "tests"
+            for f in sorted(tests_dir.rglob("*.py")) if tests_dir.is_dir() else []:
+                try:
+                    text = f.read_text(encoding="utf-8")
+                except OSError:
+                    continue
+                if any(tok in text for tok in self.ENUMERATORS):
+                    cache |= self.file_tests(str(f.relative_to(SRC)))
+            self._enum_tests = cache
+        return set(cache)
+
     def file_tests(self, path):
         return self.m.by_file.get(path, set())
 
@@ -563,8 +612,13 @@ class Selector:
         is_test_file = path.startswith("tests/")
         if deleted:  # deleted module
             return ALL if not is_test_file or "helpers" in path else self.file_tests(path)
-        if old_text is None:  # brand-new file: nothing imports it at the pinned commit
-            return set()
+        if old_text is None:
+            # brand-new file: nothing imports it by name at the pinned commit, but tests
+            # that enumerate packages/directories (pkgutil.iter_modules, listdir, glob...)
+            # will find and import it
+            if is_test_file:
+                return set()
+            return self.package_enumerator_tests()
         old_lines = old_text.split("\n")
         new_lines, old_touched, new_touched = apply_hunks(old_lines, hunks)
         try:
@@ -590,6 +644,7 @@ class Selector:
         d.body(old_tree.body, new_tree.body, ("module", None), None)
         out = set()
         mod = module_name(path)
+        enum_like = enum_like_classes(old_tree)
         if d.regions:
             tidx = self.m.touch.get(path)
             if tidx is not None:
@@ -611,11 +666,14 @@ class Selector:
                 # dialect metaclasses copy tokenizer/parser/generator settings across the
                 # family at import, so any class of the family can carry the change
                 users |= self.family_users(path)
-                readers = self.class_data_readers(path, r[2] if len(r) > 2 else None, is_test_file)
-                if readers is not None and users:
-                    # only tests that both use the class (family) and execute a read of
-                    # the changed attribute can observe the change
-                    out |= users & readers
+                readers = None if r[1] in enum_like else \
+                    self.class_data_readers(path, r[2] if len(r) > 2 else None, is_test_file)
+                if readers is not None:
+                    # a class attribute that is never read at import can only be observed by
+                    # executing a read of it. Use ALL runtime readers, not readers ∩ class
+                    # users: reads through the class object (e.g. dialect.tokenizer_class.X)
+                    # need no instance, so "users" (instantiation-based) could miss them.
+                    out |= readers
                     continue
                 if not users:
                     # never instantiated (enum, namespace, mixin...): fall back to file users
@@ -655,7 +713,9 @@ class Selector:
                     if p and p in self.m.opens:
                         chosen |= self.m.nums(self.m.set(self.m.opens[p]))
                 continue
-            if path in GLOBAL_CONFIG or (old_path and old_path in GLOBAL_CONFIG):
+            if (path in GLOBAL_CONFIG or (old_path and old_path in GLOBAL_CONFIG)
+                    or path.rsplit("/", 1)[-1] == "conftest.py"
+                    or (path.startswith("tests/") and path.endswith("__init__.py") and f["old"] is None)):
                 return ALL
             if f["old"] and f["new"] and f["old"] != f["new"] and f["old"].endswith(".py"):
                 # renamed python module: importers of the old name break

@@ -65,11 +65,12 @@ class EdgeCases(unittest.TestCase):
             "fxnw": udiff("tests/fixtures/optimizer/brand_new_case.sql", None, "SELECT 1;\nSELECT 1;\n"),
             "sqgc": udiff("sqlglotc/setup.py", "a = 1\n", "a = 2\n"),
             "conf": udiff("pyproject.toml", "a\n", "b\n"),
+            "cftn": udiff("tests/dialects/conftest.py", None, "import pytest\n"),
             "junk": "this is not a diff\n@@ nonsense @@\n+++\n",
             "empt": "",
         }
         for k, v in cls.patches.items():
-            if k not in ("junk", "empt", "rdme", "conf", "fxnw", "sqgc"):
+            if k not in ("junk", "empt", "rdme", "conf", "fxnw", "sqgc", "cftn"):
                 assert v.count("@@") >= 2, f"patch {k} did not change anything"
         cls.tmp = tempfile.TemporaryDirectory()
         data = Path(cls.tmp.name)
@@ -129,8 +130,15 @@ class EdgeCases(unittest.TestCase):
     def test_comment_only_selects_nothing(self):
         self.assertEqual(self.sel["cmnt"], set())
 
-    def test_new_unimported_file_selects_nothing(self):
-        self.assertEqual(self.sel["newf"], set())
+    def test_new_module_selects_package_enumerators_only(self):
+        # nothing imports a new module by name, but tests that enumerate packages
+        # (tests/test_typing.py uses pkgutil.iter_modules) will import it
+        typing_tests = {t["number"] for t in self.tests if t["file"] == "tests/test_typing.py"}
+        self.assertTrue(typing_tests and typing_tests <= self.sel["newf"])
+        self.assertLess(len(self.sel["newf"]), len(self.tests))
+
+    def test_nested_conftest_selects_everything(self):
+        self.assertEqual(len(self.sel["cftn"]), len(self.tests))
 
     def test_readme_selects_nothing(self):
         self.assertEqual(self.sel["rdme"], set())
