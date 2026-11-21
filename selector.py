@@ -35,7 +35,7 @@ MAX_WORKERS = 8
 GLOBAL_CONFIG = {"pyproject.toml", "setup.cfg", "tox.ini", "pytest.ini", "conftest.py", "tests/conftest.py"}
 ALL = object()  # sentinel: select every test
 # Ablation switches for measuring each safety rule (never set in the image):
-# BR_OFF=imp,family,classhdr,fixdir,fill
+# BR_OFF=imp,hdrimp,refs,family,classhdr,fixdir,fill
 OFF = set(filter(None, os.environ.get("BR_OFF", "").split(",")))
 
 
@@ -534,7 +534,7 @@ class Selector:
         # class users, which the header-change rules already select. Only statements
         # inside bodies that actually ran at import count as import-time changes.
         imp_lines = self.m.imp.get(path, set()) if "imp" not in OFF else set()
-        if imp_lines:
+        if imp_lines and "hdrimp" not in OFF:
             headers = set()
             for node in ast.walk(old_tree):
                 if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
