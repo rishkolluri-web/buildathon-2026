@@ -146,3 +146,12 @@ Two independent rules (ablation: BR_OFF=typecheck / BR_OFF=eqswap):
 | A+B | 120.11 | 1310.68 |
 
 Sample: 2haz 25.45 -> 0 s, 66ks 24.79 -> 0 s (both 0 failing in answers). Corpora ../stress_e (6 interchangeable swaps that must have 0 failing + 4 unsafe negative controls) and ../stress_b (3 Athena settings): full-suite truth running. Unit tests 49 OK.
+
+#### typecheck-v8 validation (candidate 5bf7a1edd3d213e6da2cf0fca9e5be8190fabdce)
+
+- ../stress_e truth: 6 interchangeable swaps (e1-e6) 0 failing each, candidate selects 0; negative controls kept (all tests): e8 `.upper() is text` 1141 failing incl. 34 collection errors, e7/e9/e10 0 failing.
+- ../stress_e2: 20 random interchangeable sites (seed 20261121, both directions, is/==, is not/!=): 1621 passed each, 0 failing; candidate selects 0 for all.
+- ../stress_b (Athena settings, rule B): b1 1, b2 1, b3 2 failing; 0 missed (454 selected vs champion 450 incl. fill; cost 25.45 -> 10.69 s).
+- Gate vs champion 8238fd6, sample + 10 corpora: PASS, 0/30, 0/89 truth mutants, fill 0.0 s, all narrowed patches verified; total 2038.0 -> 1430.8 s (-607.2 s, mostly the swap corpora). Unit tests 49 OK.
+- Docker (exact 5bf7a1e, no-cache amd64, make sample): 120.108 s, 0 misses (champion 170.349 s); eqsites.json in /app, mode 644; protocol OK.
+- CPU: sample 0.434 -> 0.558 s; 77 non-swap patches 0.961 -> 0.957 s; each real swap patch ~+0.27 s (AST compare of large files).
