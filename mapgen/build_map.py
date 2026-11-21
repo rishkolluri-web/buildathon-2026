@@ -16,6 +16,7 @@ Output: a gzip JSON map
   opens: {relpath: set index}                (who opened that data file)
   touch: {relpath: set index}                (who executed ANY line of the file)
   users: {"module:Class": set index}       (tests instantiating it or a subclass)
+  imp:   {relpath: [line, ...]}              (lines executed merely by importing sqlglot)
 """
 
 import argparse
@@ -44,6 +45,7 @@ def main():
     ap.add_argument("--coverage", required=True)
     ap.add_argument("--opens", required=True)
     ap.add_argument("--tracks")
+    ap.add_argument("--imports", help="json from import_lines.py")
     ap.add_argument("--tests", required=True)
     ap.add_argument("--root", required=True)
     ap.add_argument("--out", required=True)
@@ -54,10 +56,25 @@ def main():
     pos = {tid: i for i, tid in enumerate(test_ids)}
     table = SetTable()
 
+    file_bits = {}
+    for tid, i in pos.items():
+        f = tid.split("::", 1)[0]
+        file_bits[f] = file_bits.get(f, 0) | (1 << i)
+
     def bits_of(nodeids):
+        """Context/nodeid -> tests. Shared setup (setUpClass/setUpModule/scoped
+        fixtures run in one test's setup phase), teardown, and collection-time
+        work affect every test of that file, so credit them to the whole file."""
         b = 0
         for n in nodeids:
-            i = pos.get(n)
+            if n.startswith("collect:"):
+                b |= file_bits.get(n[len("collect:"):], 0)
+                continue
+            nid, _, phase = n.partition("|")
+            if phase in ("setup", "teardown"):
+                b |= file_bits.get(nid.split("::", 1)[0], 0)
+                continue
+            i = pos.get(nid)
             if i is not None:
                 b |= 1 << i
         return b
@@ -78,9 +95,9 @@ def main():
             nodeids = set()
             for c in ctxs:
                 nid = c.rsplit("|", 1)[0] if "|" in c else c
-                if nid and nid not in pos:
+                if nid and nid not in pos and not nid.startswith("collect:"):
                     unknown.add(nid)
-                nodeids.add(nid)
+                nodeids.add(c)
             b = bits_of(nodeids)
             touched |= b
             per_line[str(line)] = table.add(b)
@@ -102,14 +119,15 @@ def main():
             mro.update(json.load(open(f)))
         users = {}
         for f in glob.glob(os.path.join(args.tracks, "tracks-*.json")):
-            for nid, types in json.load(open(f)).items():
-                if nid not in pos:
+            for key, types in json.load(open(f)).items():
+                b = bits_of([key])
+                if not b:
                     continue
                 for typ in types:
                     for base in mro.get(typ, [typ]):
-                        users.setdefault(base, set()).add(nid)
+                        users[base] = users.get(base, 0) | b
         for cid in sorted(set(mro) | set(users)):
-            users_out[cid] = table.add(bits_of(users.get(cid, ())))
+            users_out[cid] = table.add(users.get(cid, 0))
 
     out = {
         "tests": test_ids,
@@ -118,6 +136,7 @@ def main():
         "opens": opens_out,
         "touch": touch_out,
         "users": users_out,
+        "imp": json.load(open(args.imports)) if args.imports else {},
     }
     with gzip.open(args.out, "wt", encoding="utf-8", compresslevel=9) as f:
         json.dump(out, f, separators=(",", ":"))

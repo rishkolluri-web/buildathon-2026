@@ -87,6 +87,34 @@ def pytest_runtest_protocol(item, nextitem):
     _current[0] = "<between>"
 
 
+# shared setup/teardown and collection-time work: credited file-wide by build_map
+@pytest.hookimpl(hookwrapper=True)
+def pytest_runtest_setup(item):
+    _current[0] = item.nodeid + "|setup"
+    yield
+    _current[0] = item.nodeid
+
+
+@pytest.hookimpl(hookwrapper=True)
+def pytest_runtest_teardown(item, nextitem):
+    _current[0] = item.nodeid + "|teardown"
+    yield
+    _current[0] = item.nodeid
+
+
+@pytest.hookimpl(hookwrapper=True)
+def pytest_make_collect_report(collector):
+    if not isinstance(collector, pytest.Module):
+        yield
+        return
+    prev = _current[0]
+    _current[0] = "collect:" + os.path.relpath(str(collector.path), os.environ.get("SQLGLOT_ROOT", os.getcwd()))
+    try:
+        yield
+    finally:
+        _current[0] = prev
+
+
 def pytest_sessionfinish(session, exitstatus):
     os.makedirs(_OUT, exist_ok=True)
     pid = os.getpid()

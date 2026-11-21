@@ -53,6 +53,7 @@ class Map:
         self.opens = m["opens"]
         self.touch = m["touch"]
         self.users = m.get("users", {})
+        self.imp = {k: set(v) for k, v in m.get("imp", {}).items()}
         # map bit positions -> tests.json numbers (by id, robust to reordering)
         num_by_id = {t["id"]: t["number"] for t in tests}
         self.bit_to_num = [num_by_id.get(tid) for tid in m["tests"]]
@@ -274,7 +275,8 @@ class Differ:
             # header changed
             if isinstance(o, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 self.regions.append(("lines", span(o)))
-                if ctx[0] == "class" and o.name != n.name:
+                if ctx[0] == "class":
+                    # decorators/defaults/name are evaluated at class creation
                     self.regions.append(("class", ctx[1]))
                 elif ctx[0] == "module" and o.name != n.name:
                     self.regions.append(("module",))
@@ -296,7 +298,8 @@ class Differ:
         # import-time statement in a class body / module: is the change only inside lambdas?
         lam = lambda_only_diff(o, n)
         if lam is not None:
-            self.regions.append(("lines", lam))
+            # lambda bodies run when called, never at import: plain coverage applies
+            self.regions.append(("lambda", lam))
             return
         self.unit_change(o, ctx)
 
@@ -353,6 +356,22 @@ class Selector:
     def __init__(self, m: Map):
         self.m = m
 
+    FAMILY_DIRS = ("dialects", "parsers", "generators", "tokenizers", "typing")
+
+    def family_users(self, path):
+        parts = path.split("/")
+        if len(parts) != 3 or parts[0] != "sqlglot" or parts[1] not in self.FAMILY_DIRS:
+            return set()
+        base = parts[2][:-3]
+        if base in ("__init__", "dialect"):
+            return set()
+        mods = {f"sqlglot.{d}.{base}:" for d in self.FAMILY_DIRS}
+        bits = 0
+        for cid, idx in self.m.users.items():
+            if cid[: cid.index(":") + 1] in mods:
+                bits |= self.m.set(idx)
+        return self.m.nums(bits)
+
     def lines_bits(self, path, lines):
         per = self.m.lines.get(path, {})
         b = 0
@@ -384,12 +403,27 @@ class Selector:
         d.body(old_tree.body, new_tree.body, ("module", None), None)
         out = set()
         mod = module_name(path)
+        if d.regions:
+            tidx = self.m.touch.get(path)
+            if tidx is not None:
+                self.related |= self.m.nums(self.m.set(tidx))
+            self.related |= self.family_users(path)
         for r in d.regions:
             if r[0] == "lines":
+                if not is_test_file and r[1] & self.m.imp.get(path, set()):
+                    # runs while sqlglot is imported (metaclass, __init_subclass__,
+                    # factories used in class bodies): every test inherits its effect
+                    log(f"  {path}: import-time line(s) {sorted(r[1] & self.m.imp[path])[:5]} -> all tests")
+                    return ALL
+                out |= self.m.nums(self.lines_bits(path, r[1]))
+            elif r[0] == "lambda":
                 out |= self.m.nums(self.lines_bits(path, r[1]))
             elif r[0] == "class":
                 idx = self.m.users.get(f"{mod}:{r[1]}")
                 users = self.m.nums(self.m.set(idx)) if idx is not None else set()
+                # dialect metaclasses copy tokenizer/parser/generator settings across the
+                # family at import, so any class of the family can carry the change
+                users |= self.family_users(path)
                 if not users:
                     # never instantiated (enum, namespace, mixin...): fall back to file users
                     tidx = self.m.touch.get(path)
@@ -406,9 +440,12 @@ class Selector:
                 else:
                     log(f"  {path}: module-level change -> all tests")
                     return ALL
+        if d.regions and path in self.m.opens:  # tests that read this source file as data
+            out |= self.m.nums(self.m.set(self.m.opens[path]))
         return out
 
     def select(self, patch_text):
+        self.related = set()
         files = parse_patch(patch_text)
         if not files:
             return set()
@@ -443,9 +480,21 @@ class Selector:
                     return ALL
                 chosen |= r
             else:
+                hit = False
                 for p in (f["old"], f["new"]):
                     if p and p in self.m.opens:
                         chosen |= self.m.nums(self.m.set(self.m.opens[p]))
+                        hit = True
+                if not hit and path.startswith("tests/"):
+                    # data file no test opened at the pinned commit (new or listed by
+                    # directory): take the readers of its sibling files
+                    folder = path.rsplit("/", 1)[0] + "/"
+                    for p, idx in self.m.opens.items():
+                        if p.startswith(folder):
+                            chosen |= self.m.nums(self.m.set(idx))
+                if path.endswith(".py") and "/" in path and not path.startswith(("sqlglot/", "tests/")):
+                    # e.g. sqlglotc/*.py: exercised by tests/test_sqlglotc.py
+                    chosen |= self.file_tests(f"tests/test_{path.split('/', 1)[0]}.py")
         return chosen
 
 
@@ -472,10 +521,31 @@ def pack(nums, ms):
     return best, best_cost
 
 
+def fill_idle(workers, ms, candidates):
+    """Add candidate tests to workers' idle time; the busiest load never grows."""
+    if not workers:
+        return 0
+    loads = [sum(ms[n] for n in w) for w in workers]
+    cap = max(loads)
+    added = 0
+    for n in sorted(candidates, key=lambda n: (ms[n], n)):
+        d = ms[n]
+        i = max(range(len(workers)), key=lambda j: (cap - loads[j], -j))
+        if cap - loads[i] < d:
+            if d == 0:
+                continue
+            break  # sorted by duration: nothing longer fits either
+        workers[i].append(n)
+        loads[i] += d
+        added += 1
+    return added
+
+
 def main():
     tests = json.loads((DATA / "tests.json").read_text())["tests"]
     ms = {t["number"]: round(t["seconds"] * 1000) for t in tests}
     every = set(ms)
+    sel_file = {t["number"]: t["file"] for t in tests}
     try:
         sel = Selector(Map(MAP, tests))
     except Exception as e:  # no usable map: run everything rather than crash
@@ -493,8 +563,14 @@ def main():
             chosen = every
         chosen = {n for n in chosen if n in ms}
         workers, cost = pack(chosen, ms)
+        extra = 0
+        if sel and workers and len(chosen) < len(ms):
+            related = set(sel.related)
+            for f in {sel_file[n] for n in chosen}:
+                related |= sel.m.by_file.get(f, set())
+            extra = fill_idle(workers, ms, (related & set(ms)) - chosen)
         total += cost
-        log(f"{cid}: {len(chosen)} tests, {len(workers)} workers, {cost / 1000:.3f}s")
+        log(f"{cid}: {len(chosen)} tests (+{extra} free), {len(workers)} workers, {cost / 1000:.3f}s")
         sys.stdout.write(json.dumps({"commit": cid, "workers": workers}, separators=(",", ":")) + "\n")
     sys.stdout.flush()
     log(f"estimated simulated cost without misses: {total / 1000:.3f}s")

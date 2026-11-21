@@ -55,12 +55,14 @@ class EdgeCases(unittest.TestCase):
             "hlpr": udiff("tests/helpers.py", helpers, helpers.replace("def load_sql_fixtures(filename):\n", "def load_sql_fixtures(filename):\n    filename = filename.strip()\n", 1)),
             "mcon": udiff("sqlglot/helper.py", helper, helper.replace("\nlogger = ", "\nUNUSED_CONST = 3\nlogger = ", 1)),
             "rdme": udiff("README.md", "a\n", "b\n"),
+            "fxnw": udiff("tests/fixtures/optimizer/brand_new_case.sql", None, "SELECT 1;\nSELECT 1;\n"),
+            "sqgc": udiff("sqlglotc/setup.py", "a = 1\n", "a = 2\n"),
             "conf": udiff("pyproject.toml", "a\n", "b\n"),
             "junk": "this is not a diff\n@@ nonsense @@\n+++\n",
             "empt": "",
         }
         for k, v in cls.patches.items():
-            if k not in ("junk", "empt", "rdme", "conf"):
+            if k not in ("junk", "empt", "rdme", "conf", "fxnw", "sqgc"):
                 assert v.count("@@") >= 2, f"patch {k} did not change anything"
         cls.tmp = tempfile.TemporaryDirectory()
         data = Path(cls.tmp.name)
@@ -117,9 +119,36 @@ class EdgeCases(unittest.TestCase):
     def test_helper_edit_selects_its_users(self):
         self.assertTrue(self.sel["hlpr"], "tests/helpers.py change must select fixture users")
 
+    def test_unopened_fixture_selects_sibling_readers(self):
+        self.assertIn(self.num("tests/test_optimizer.py::TestOptimizer::test_simplify"), self.sel["fxnw"])
+
+    def test_sqlglotc_change_selects_its_tests(self):
+        nums = {t["number"] for t in self.tests if t["file"] == "tests/test_sqlglotc.py"}
+        self.assertTrue(nums and nums <= self.sel["sqgc"])
+
     def test_garbage_and_empty_patches_do_not_crash(self):
         self.assertIn("junk", self.sel)
         self.assertIn("empt", self.sel)
+
+
+class FillIdle(unittest.TestCase):
+    def test_never_raises_busiest_worker(self):
+        sys.path.insert(0, str(REPO))
+        import random
+
+        from selector import fill_idle, pack
+
+        rng = random.Random(1)
+        for _ in range(200):
+            ms = {i: rng.choice([0, 0, 1, 3, 10, 50, 400, 2000]) for i in range(60)}
+            chosen = set(rng.sample(range(60), rng.randint(1, 20)))
+            workers, cost = pack(chosen, ms)
+            before = max(sum(ms[n] for n in w) for w in workers)
+            fill_idle(workers, ms, set(ms) - chosen)
+            flat = [n for w in workers for n in w]
+            self.assertEqual(len(flat), len(set(flat)))
+            self.assertEqual(max(sum(ms[n] for n in w) for w in workers), before)
+            self.assertTrue(chosen <= set(flat))
 
 
 if __name__ == "__main__":
