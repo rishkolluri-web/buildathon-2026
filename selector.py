@@ -555,6 +555,67 @@ def op_change_sites(old_tree, new_tree, touched):
     return sites or None
 
 
+_CV_OPS = {ast.Lt: "lt", ast.LtE: "le", ast.Gt: "gt", ast.GtE: "ge", ast.Eq: "eq", ast.NotEq: "ne"}
+
+
+def balanced_hunks(hunks):
+    """Every hunk removes as many lines as it adds (line numbers coincide outside hunks)."""
+    for _, lines in hunks:
+        if sum(1 for t, _ in lines if t == "-") != sum(1 for t, _ in lines if t == "+"):
+            return False
+    return True
+
+
+def const_change_sites(old_tree, new_tree, touched):
+    """[("line:col" of the Compare, op type, constant side 0/1, old value, new value)] if the ONLY
+    differences between the trees are int/str constants that are the single constant operand of a
+    single-operator ==, !=, <, <=, >, >= comparison (same type before and after); else None."""
+    sites = []
+
+    def const(x):
+        return isinstance(x, ast.Constant) and type(x.value) in (int, str)
+
+    def same(a, b):
+        if type(a) is not type(b):
+            return False
+        if isinstance(a, ast.AST):
+            if isinstance(a, ast.stmt):
+                st = first_line(a)
+                if (st == first_line(b) and a.end_lineno == b.end_lineno and a.col_offset == b.col_offset
+                        and a.end_col_offset == b.end_col_offset and not any(st <= ln <= a.end_lineno for ln in touched)):
+                    return True
+            if isinstance(a, ast.Compare) and len(a.ops) == 1 and type(a.ops[0]) in _CV_OPS \
+                    and [type(o) for o in a.ops] == [type(o) for o in b.ops]:
+                sa, sb = [a.left, a.comparators[0]], [b.left, b.comparators[0]]
+                ca = [i for i, x in enumerate(sa) if const(x)]
+                if len(ca) == 1 and [i for i, x in enumerate(sb) if const(x)] == ca:
+                    i = ca[0]
+                    x, y = sa[i], sb[i]
+                    if type(x.value) is type(y.value) and x.value != y.value and x.kind == y.kind:
+                        sites.append((f"{a.lineno}:{a.col_offset}", type(a.ops[0]), i, x.value, y.value))
+                        return same(sa[1 - i], sb[1 - i])
+            if isinstance(a, ast.Constant):
+                return a.value == b.value and type(a.value) is type(b.value) and a.kind == b.kind
+            for f in a._fields:
+                if not same(getattr(a, f, None), getattr(b, f, None)):
+                    return False
+            return True
+        if isinstance(a, list):
+            return len(a) == len(b) and all(same(x, y) for x, y in zip(a, b))
+        return a == b
+
+    if not same(old_tree, new_tree):
+        return None
+    return sites or None
+
+
+def cmp_result(op, v, c, cside):
+    import operator
+
+    f = getattr(operator, _CV_OPS[op])
+    return f(c, v) if cside == 0 else f(v, c)
+
+
 # expression nodes whose evaluation cannot raise or run code when only Constant leaves change
 _INERT_PARENTS = (ast.Tuple, ast.List, ast.Set, ast.Dict)
 _ACTIVE = (ast.Call, ast.Await, ast.Yield, ast.YieldFrom, ast.NamedExpr, ast.ListComp, ast.SetComp,
@@ -735,6 +796,34 @@ class Selector:
             except (OSError, SyntaxError):
                 cache[rel] = None
         return cache[rel]
+
+    def const_change(self, path, old_tree, new_tree, touched):
+        """Only the constant of single-constant comparisons changed in this file: the tests that observed
+        an operand value for which old and new constant give different results, plus tests with unknown
+        observations there, plus untraced tests. None -> rule not applicable (normal selection)."""
+        diffs = const_change_sites(old_tree, new_tree, touched)
+        if not diffs:
+            return None
+        v = self.vmap()
+        if not v or "cv" not in v:
+            return None
+        out = set(v["bit_to_num"][i] for i in v.get("untraced", []) if v["bit_to_num"][i] is not None)
+        for site, op, cside, old_c, new_c in diffs:
+            e = v["cv"].get(f"{path}:{site}")
+            if e is None:
+                return None  # never executed under tracing (or not instrumented): coverage rules
+            if e["unk"]:
+                if e["unk"][1]:
+                    return None  # unknown observation outside a test
+                out |= self.vnums(v, e["unk"][0])
+            for typ, val, idx, all_ in e["vals"]:
+                if cmp_result(op, val, old_c, cside) != cmp_result(op, val, new_c, cside):
+                    if all_:
+                        return None  # result changes during import/session/subprocess
+                    out |= self.vnums(v, idx)
+        log(f"  {path}: comparison constant change(s) {[(s, c0, c1) for s, _, _, c0, c1 in diffs]} "
+            f"-> {len(out)} tests whose observed values change the result")
+        return out
 
     def dict_value_change(self, path, o, n):
         """A class-body dict literal whose keys are unchanged and whose entry values differ only
@@ -1466,6 +1555,10 @@ class Selector:
                 return self.opened_by(path)  # tests reading this source file as text still see it
         if not is_test_file and op_only_hunks(hunks):
             r = self.op_change(path, old_tree, new_tree, old_touched | new_touched)
+            if r is not None:
+                return r | self.opened_by(path)
+        if not is_test_file and "cvconst" not in OFF and balanced_hunks(hunks):
+            r = self.const_change(path, old_tree, new_tree, old_touched | new_touched)
             if r is not None:
                 return r | self.opened_by(path)
         # def/class header lines (decorators, signature, defaults) execute at import to

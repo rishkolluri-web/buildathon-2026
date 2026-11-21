@@ -44,7 +44,44 @@ _CMP_DONE = {}  # (site, ctx) -> bitmask of alternatives already recorded
 _OPS = (operator.lt, operator.le, operator.gt, operator.ge, operator.eq, operator.ne)
 _OPNAMES = ("Lt", "LtE", "Gt", "GtE", "Eq", "NotEq")
 _REL = {ast.Lt: 0, ast.LtE: 1, ast.Gt: 2, ast.GtE: 3}
+_ALL6 = {ast.Lt: 0, ast.LtE: 1, ast.Gt: 2, ast.GtE: 3, ast.Eq: 4, ast.NotEq: 5}
+CV = {}  # site -> {ctx: set of observed non-constant operand values, or "U" (unknown)}
+CV_MAX = 64  # distinct values per (site, context); beyond -> "U"
+_PLAIN = (int, float, str, bytes, bool, type(None))
+
+
+def _plain(x, depth=0):
+    """Builtin value whose comparisons are pure (no user __lt__/__eq__, no side effects)."""
+    t = type(x)
+    if t in _PLAIN:
+        return True
+    if t in (tuple, list) and depth < 3 and len(x) <= 64:
+        return all(_plain(e, depth + 1) for e in x)
+    return False
+
+
+def _cv_rec(site, ctx, other, const, op):
+    """Value of the non-constant operand of a single-constant comparison. Only exact int/str values
+    are recorded (== / != with int or str constants, relational ops with int constant and int value);
+    anything else (bools, floats, subclasses, custom objects, mixed types for <) -> unknown."""
+    s = CV.get(site)
+    if s is None:
+        s = CV[site] = {}
+    cur = s.get(ctx)
+    if cur == "U":
+        return
+    t = type(other)
+    ok = (t is int or t is str) and (op >= 4 or (t is int and type(const) is int))
+    if not ok:
+        s[ctx] = "U"
+        return
+    if cur is None:
+        cur = s[ctx] = set()
+    cur.add(other)
+    if len(cur) > CV_MAX:
+        s[ctx] = "U"
 _FULL = 0b111111
+DONE = set()  # nodeids whose call phase completed (passed/skipped) under tracing
 # >0 while a sqlglot module body executes. sqlglot imports dialect modules lazily (inside the
 # first test that needs one), so class creation, metaclasses and derived tables (MySQL's
 # INVERSE_TIME_MAPPING built from TIME_MAPPING) run within some test; their reads feed state
@@ -164,17 +201,31 @@ def _vt_dict(site, d, keys):
     return v
 
 
-def _vt_cmp(site, a, b, op):
+def _vt_cmp(site, a, b, op, cside=-1):
+    """Original comparison `a <op> b` (operands evaluated once, in order, by the caller).
+    cside: 0 / 1 = the left / right operand is the site's only int/str constant (-1: none)."""
     ctx = _ctx()
-    key = (site, ctx)
-    done = _CMP_DONE.get(key, 1 << op)
     try:
         r = _OPS[op](a, b)
     except BaseException:
-        _cmp_rec(site, ctx, _FULL & ~(1 << op))
-        _CMP_DONE[key] = _FULL
+        if cside >= 0:
+            CV.setdefault(site, {})[ctx] = "U"
+        if op < 4:
+            _cmp_rec(site, ctx, _FULL & ~(1 << op))
+            _CMP_DONE[(site, ctx)] = _FULL
         raise
+    if cside >= 0:
+        _cv_rec(site, ctx, b if cside == 0 else a, a if cside == 0 else b, op)
+    if op >= 4:
+        return r
+    key = (site, ctx)
+    done = _CMP_DONE.get(key, 1 << op)
     if done == _FULL:
+        return r
+    if not (_plain(a) and _plain(b)):
+        # custom/unknown operand types: never evaluate other operators (user code, side effects)
+        _cmp_rec(site, ctx, _FULL & ~done)
+        _CMP_DONE[key] = _FULL
         return r
     new = 0
     for j in range(6):
@@ -241,11 +292,17 @@ class _Rewrite(ast.NodeTransformer):
 
     def visit_Compare(self, node):
         self.generic_visit(node)
-        if len(node.ops) != 1 or type(node.ops[0]) not in _REL:
+        if len(node.ops) != 1 or type(node.ops[0]) not in _ALL6:
+            return node
+        sides = [node.left, node.comparators[0]]
+        consts = [i for i, x in enumerate(sides) if isinstance(x, ast.Constant) and type(x.value) in (int, str)]
+        cside = consts[0] if len(consts) == 1 else -1
+        if type(node.ops[0]) not in _REL and cside < 0:
             return node
         site = f"{self.rel}:{node.lineno}:{node.col_offset}"
         call = ast.Call(func=ast.Name(id="__vt_cmp__", ctx=ast.Load()),
-                        args=[ast.Constant(site), node.left, node.comparators[0], ast.Constant(_REL[type(node.ops[0])])],
+                        args=[ast.Constant(site), node.left, node.comparators[0],
+                              ast.Constant(_ALL6[type(node.ops[0])]), ast.Constant(cside)],
                         keywords=[])
         return ast.copy_location(call, node)
 
@@ -306,6 +363,9 @@ def _dump():
         "dmeta": DMETA,
         "cmp": {s: {_OPNAMES[j]: sorted(c) for j, c in v.items()} for s, v in CMP.items()},
         "cmp_seen": sorted({s for s, _ in _CMP_DONE}),
+        "cv": {s: {c: (v if v == "U" else sorted(v, key=lambda x: (type(x).__name__, x))) for c, v in d.items()}
+               for s, d in CV.items()},
+        "done": sorted(DONE),
     }
     with open(os.path.join(out, f"vt-{os.getpid()}.json"), "w") as f:
         json.dump(data, f)
@@ -334,6 +394,7 @@ def merge(indir, tests_json, outfile):
     for t, i in pos.items():
         by_file.setdefault(t.split("::")[0], set()).add(i)
     dreads, dmeta, cmp, seen = {}, {}, {}, set()
+    cvals, done = {}, set()  # site -> {("int"|"str", value) | "U": set(ctx)}
     for name in sorted(os.listdir(indir)):
         if not name.startswith("vt-"):
             continue
@@ -348,6 +409,15 @@ def merge(indir, tests_json, outfile):
             for j, c in v.items():
                 cmp.setdefault(s, {}).setdefault(j, set()).update(c)
         seen.update(d["cmp_seen"])
+        done.update(d.get("done", ()))
+        for site, per in d.get("cv", {}).items():
+            e = cvals.setdefault(site, {})
+            for ctx, vals in per.items():
+                if vals == "U":
+                    e.setdefault("U", set()).add(ctx)
+                else:
+                    for v in vals:
+                        e.setdefault((type(v).__name__, v), set()).add(ctx)
     sets, set_idx = [], {}
 
     def encode(ctxs):
@@ -394,6 +464,19 @@ def merge(indir, tests_json, outfile):
             if all_:
                 e["all"].append(j)
         out["cmp"][s] = e
+    out["cv"] = {}
+    for site, e in cvals.items():
+        rec = {"vals": [], "unk": None}
+        for k, ctxs in e.items():
+            idx, all_ = encode(ctxs)
+            if k == "U":
+                rec["unk"] = [idx, all_]
+            else:
+                rec["vals"].append([k[0], k[1], idx, all_])
+        out["cv"][site] = rec
+    # tests that never completed under tracing: every value-based narrowing must keep them
+    untraced = {i for t, i in pos.items() if t not in done}
+    out["untraced"] = sorted(untraced)
     out["sets"] = sets
     with gzip.open(outfile, "wt", encoding="utf-8") as f:
         json.dump(out, f, separators=(",", ":"))

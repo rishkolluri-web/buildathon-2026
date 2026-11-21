@@ -72,3 +72,11 @@ def pytest_make_collect_report(collector):
         vtrace._current[0] = prev
 
 
+
+
+def pytest_runtest_logreport(report):
+    # completion record: a test absent from DONE is untraced (the selector always keeps it)
+    if report.when == "call" and (report.passed or report.skipped):
+        vtrace.DONE.add(report.nodeid)
+    elif report.when == "setup" and report.skipped:
+        vtrace.DONE.add(report.nodeid)

@@ -110,6 +110,12 @@ class EdgeCases(unittest.TestCase):
             "tloc": udiff("tests/test_parser.py", read("tests/test_parser.py"), read("tests/test_parser.py").replace(
                 'parse_one("SELECT * FROM (SELECT 1) UNION SELECT 2"), exp.Union)',
                 'parse_one("SELECT * FROM (SELECT 1) UNION SELECT 2"), exp.Intersect)', 1)),
+            # comparison-constant rule (value trace of single-constant comparisons)
+            "cvok": udiff("sqlglot/errors.py", errors, "\n".join(
+                l.replace("> 0", "> 1", 1) if i == 169 and "> 0" in l else l for i, l in enumerate(errors.split("\n")))),
+            "cvmix": udiff("sqlglot/errors.py", errors, "\n".join(
+                l.replace("> 0", "> 1", 1) if i == 169 and "> 0" in l else l for i, l in enumerate(errors.split("\n")))
+                .replace("ERROR_MESSAGE_CONTEXT_DEFAULT = 100", "ERROR_MESSAGE_CONTEXT_DEFAULT = 101", 1)),
             "nopt": udiff("sqlglot/optimizer/zz_rule.py", None, "def zz_rule(expression):\n    return expression\n"),
             "delf": udiff("sqlglot/dialects/tsql.py", tsql, None),
             "tfil": udiff("tests/test_transpile.py", transpile,
@@ -328,6 +334,10 @@ class EdgeCases(unittest.TestCase):
 
     def test_isolated_test_body_stays_local(self):
         self.assertLess(len(self.sel["tloc"]), 20)
+
+    def test_comparison_constant_rule_applies_only_to_pure_constant_changes(self):
+        self.assertIn("sqlglot/errors.py: comparison constant change", self.stderr)
+        self.assertGreater(len(self.sel["cvmix"]), len(self.sel["cvok"]))  # extra edit -> normal rules
 
     def test_static_index_changes_nothing(self):
         self.assertEqual(self.raw_idx, self.raw)  # build-time index == lazy computation
