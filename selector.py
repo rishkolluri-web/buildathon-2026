@@ -608,12 +608,13 @@ class Selector:
     DYN_SELF = re.compile(r"""import_module\(\s*f["']\{__name__\}\.""")
 
     def name_loaded_packages(self):
-        """Packages (dotted) whose submodules the pinned sqlglot imports by a name computed
-        at runtime: import_module(f"pkg.{x}") anywhere, or import_module(f"{__name__}.{x}")
-        in a package __init__. Derived from the pinned source, cached."""
+        """{package (dotted): [(file, line) of the import call]} for packages whose submodules
+        the pinned sqlglot imports by a name computed at runtime: import_module(f"pkg.{x}")
+        anywhere, or import_module(f"{__name__}.{x}") in a package __init__. Derived from
+        the pinned source, cached."""
         cache = self.__dict__.get("_dyn_pkgs")
         if cache is None:
-            cache = set()
+            cache = {}
             root = SRC / "sqlglot"
             for f in sorted(root.rglob("*.py")) if root.is_dir() else []:
                 try:
@@ -622,9 +623,13 @@ class Selector:
                     continue
                 if "import_module" not in text:
                     continue
-                cache |= {m.group(1) for m in self.DYN_IMPORT.finditer(text) if m.group(1)}
-                if f.name == "__init__.py" and self.DYN_SELF.search(text):
-                    cache.add(module_name(str(f.relative_to(SRC))))
+                rel = str(f.relative_to(SRC))
+                for i, line in enumerate(text.split("\n"), 1):
+                    for m in self.DYN_IMPORT.finditer(line):
+                        if m.group(1):
+                            cache.setdefault(m.group(1), []).append((rel, i))
+                    if f.name == "__init__.py" and self.DYN_SELF.search(line):
+                        cache.setdefault(module_name(rel), []).append((rel, i))
             self._dyn_pkgs = cache
         return cache
 
@@ -642,17 +647,24 @@ class Selector:
             # will find and import it
             if is_test_file:
                 return set()
-            if path.startswith("sqlglot/dialects/"):
+            mod = module_name(path)
+            sites = [ln for p, lns in self.name_loaded_packages().items() if mod.startswith(p + ".") for ln in lns]
+            if path.startswith("sqlglot/dialects/") or sites:
                 # Dialect._try_load also imports a module named by the requested dialect.
                 # Existing tests may request that name expecting an unknown-dialect error.
-                return ALL
-            mod = module_name(path)
-            if any(mod.startswith(p + ".") for p in self.name_loaded_packages()):
-                # sqlglot imports submodules of this package by a runtime name (lazy
-                # __getattr__, dialect lookup): the new module changes what such a name
-                # resolves to, which any test may probe
-                log(f"  {path}: new module in a package loaded by name -> all tests")
-                return ALL
+                # More generally sqlglot imports submodules of this package by a runtime
+                # name (dialect lookup, lazy __getattr__): the new module changes what such
+                # a name resolves to. Only a test that executes one of those import calls
+                # can probe it, and a failed lookup is never cached, so the coverage of
+                # those lines is complete for names that do not exist yet.
+                tests = set()
+                for rel, ln in sites:
+                    tests |= self.m.nums(self.lines_bits(rel, [ln]))
+                if not tests or "dynsite" in OFF:
+                    log(f"  {path}: new module in a package loaded by name -> all tests")
+                    return ALL
+                log(f"  {path}: new module in a package loaded by name -> {len(tests)} probing tests")
+                return tests | self.package_enumerator_tests()
             return self.package_enumerator_tests()
         old_lines = old_text.split("\n")
         new_lines, old_touched, new_touched = apply_hunks(old_lines, hunks)
@@ -705,10 +717,20 @@ class Selector:
                     self.class_data_readers(path, r[2] if len(r) > 2 else None, is_test_file)
                 if readers is not None:
                     # a class attribute that is never read at import can only be observed by
-                    # executing a read of it. Use ALL runtime readers, not readers ∩ class
-                    # users: reads through the class object (e.g. dialect.tokenizer_class.X)
-                    # need no instance, so "users" (instantiation-based) could miss them.
-                    out |= readers
+                    # executing a read of it (readers, by attribute NAME), on this class or a
+                    # subclass. Generic names (NULL_ORDERING, _hash_raw_args...) are read on
+                    # many unrelated classes, so also require that the test reaches this
+                    # class: instantiates it or a subclass (users, rolled up to bases), uses
+                    # its dialect family, or executes any line of this file (covers reads
+                    # through the class object, e.g. dialect.parser_class.X, with no instance).
+                    scope = set(users)
+                    if "classscope" not in OFF:
+                        tidx = self.m.touch.get(path)
+                        if tidx is not None:
+                            scope |= self.m.nums(self.m.set(tidx))
+                        out |= readers & scope
+                    else:
+                        out |= readers
                     continue
                 if not users:
                     # never instantiated (enum, namespace, mixin...): fall back to file users

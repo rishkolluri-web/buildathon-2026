@@ -85,3 +85,14 @@ test_execute_tpcds (21.454 s) review: selected through coverage of the changed l
   | u5 base flag SUPPORTS_UESCAPE | 2 | 1381, 0 missed | 26, 0 missed | 26, 0 missed |
 
   u6/u7 and m050/m066/m068 truth still running. Docker on exact 107a4c3 (no-cache amd64, kit make sample): 170.356 s, 0 misses; protocol check on its output OK.
+
+### Official BB-709BA77F (107a4c3): 222.0 s, 0 misses (simulated 220.777 s) vs c003640 190.8 s (189.804 s)
+
+Regression investigation (hidden commits unknown; only selector.py differs: map.json.gz, Dockerfile, docker/ identical; CPU +0.2 s official, negligible locally):
+1. Class data -> all runtime readers by attribute NAME: over all 3701 class-level assignments in pinned sqlglot, wider than c003640 on 148 (avg +15.3 s, up to +25 s: generic dialect flags NULL_ORDERING/TABLE_HINTS/LIMIT_FETCH/SUPPORTS_*, and _hash_raw_args), narrower on 916. Most likely cause (dialect-flag tweaks are common).
+2. New module in sqlglot/dialects or sqlglot/optimizer -> all tests: +34.8 s per such commit (c003640: 0 tests).
+3. New module elsewhere -> package enumerators: +2 s. 4. Nested conftest/new tests __init__ -> all: never triggered. 5. CPU: ~0.
+Fixes (this commit): class data -> readers ∩ (class users ∪ dialect family ∪ tests executing any line of the file); sweep: wider 148 -> 15 (all _hash_raw_args), narrower 916 -> 1051. New module in a name-loaded package -> tests executing the name-based import calls (unknown names are never cached) ∪ enumerators, ALL if none: u1 36.82 -> 9.43 s (95 tests, #193 kept), u2/t2 36.82 -> 12.61 s.
+Truth added: u6 0, u7 1, m050 0, m066 0, m068 463 (incl. COLLECT test_mysql.py) failing; all selected.
+Gate vs c003640 (stress + stress_h3 + stress_x + stress_u): PASS, 0/30 sample, 0/38 mutants, total 1269.3 -> 1148.0 s (-121.3 s), fill 0.0 s, unit tests 42 OK (1 skipped). Docker (exact snapshot da383f7, no-cache amd64, make sample): 170.349 s, 0 misses, protocol OK. CPU sample 0.244 (c003640) / 0.237 (107a4c3) / 0.249 s; 91 mutations 1.43 / 1.61 / 1.63 s.
+c003640 known gap: a new sqlglot/dialects/<name>.py (u1) breaks test_get_or_raise; c003640 selects 0 tests.

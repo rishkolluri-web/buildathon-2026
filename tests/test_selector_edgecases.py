@@ -146,11 +146,20 @@ class EdgeCases(unittest.TestCase):
         self.assertIn(self.num("tests/dialects/test_dialect.py::TestDialect::test_get_or_raise"),
                       self.sel["ndia"])
 
-    def test_new_module_in_name_loaded_package_selects_everything(self):
-        # sqlglot.optimizer.__getattr__ imports f"{__name__}.{name}": a new submodule turns
-        # a missing attribute into a real one, which no coverage map can attribute
-        self.assertEqual(len(self.sel["nopt"]), len(self.tests))
-        self.assertEqual(len(self.sel["ndia"]), len(self.tests))
+    def test_new_module_in_name_loaded_package_selects_probing_tests(self):
+        # sqlglot.optimizer.__getattr__ imports f"{__name__}.{name}" and Dialect._try_load
+        # imports f"sqlglot.dialects.{key}": a new submodule changes what a probed name
+        # resolves to. The tests that execute those import calls must be selected.
+        sys.path.insert(0, str(REPO))
+        import selector
+        sel = selector.Selector(selector.Map(selector.MAP, self.tests))
+        for case, pkg in (("nopt", "sqlglot.optimizer"), ("ndia", "sqlglot.dialects")):
+            sites = sel.name_loaded_packages()[pkg]
+            probing = set()
+            for rel, ln in sites:
+                probing |= sel.m.nums(sel.lines_bits(rel, [ln]))
+            self.assertTrue(probing and probing <= self.sel[case], case)
+            self.assertLess(len(self.sel[case]), len(self.tests), case)
 
     def test_nested_conftest_selects_everything(self):
         self.assertEqual(len(self.sel["cftn"]), len(self.tests))
