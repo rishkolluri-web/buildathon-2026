@@ -181,3 +181,16 @@ Equivalence evidence: scripts/diff_swap.py over EVERY single-op is/==/is not/!= 
 Unit test: build-time index == lazy == corrupt-index output on every edge-case patch.
 gate.py fix: the base revision now also gets its eqsites.json (before, gating against v8 ran v8 without
 its swap rule and overstated the base cost).
+
+### experiment/testdep-fix (8991e94c0334683f17c48dd7f7ae6f2b63d00a36, base ddd9678) — safety fix
+
+- Bug (Person 1): a test-module change selected only its own file; tests/dialects/test_dialect.py is imported by 33
+  test modules. t1 (line 24 `_base_module` -> `_base_modulex`): local truth 34 collection errors (whole files, ~1,020
+  tests); ddd9678 selected 120 (miss); fix selects 1,020.
+- Corpus ../stress_t: t1 module line (34 collect errors), t2 Validator class attr (35 failing), t3 helpers.is_compiled
+  body flipped — runs at test_dialect import (0 failing; fix selects 1,035, conservative), t4 isolated test body
+  (1 failing; stays local: 1 test).
+- Gate vs ddd9678 (--allow-cost-increase), sample + 16 corpora: PASS, 0/30, 0/187 truth mutants, unit tests OK, fill 0.0 s;
+  sample 101.6 -> 101.6 s; mutants 2647.8 -> 2655.8 s (+8.0 s, test-module patches only).
+- CPU (bench, 3 runs, static index): sample 0.195 s (ddd9678 with its own index ≈0.20 s); test-module patches +≈0.15 s.
+- Docker (no-cache amd64, git archive 8991e94): make sample 101.552 s, 0 misses; t1–t4 in image identical to local.
