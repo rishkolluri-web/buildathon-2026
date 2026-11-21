@@ -351,3 +351,29 @@ Diagnosis: 3 official submissions at exactly 174.5 s while the sample improved. 
   (extra parse only when a slow test is selected).
 - Docker (no-cache amd64, git archive f8f2070, kit make -o build sample): 101.368 s, 0 misses; image run with the
   kit RUN_FLAGS on ../stress_hvv byte-identical to local (62 drops logged in-image).
+
+### Audit (check 2) results after v20 — 2026-11-21 afternoon
+
+- vtrace rebuilds (seed 7 x 3 workers, seed 13 x 8 workers) vs shipped vmap.json.gz, full entry-by-entry diff by test
+  id: only 5 differing entries, all `attr` reads owned by "inst" (DAX, PRQL, DATE_UNITS = module attributes;
+  EXPRESSION_METADATA/TSQL instance reads). traced_attr_readers consults only class owners and "?": harmless.
+- iso_imp rebuild (venv python, 5 jobs) vs shipped: 24,515 / 24,515 entries identical.
+- Coverage map rebuild (4 workers) vs shipped: 23 differing entries, all dialect.py 240-302 (lazy dialect
+  re-registration) plus one entry_points.txt open. Root cause: TestDialectEntryPoints clears Dialect._classes in
+  setUp/tearDown; later tests in the same worker re-run Dialect._try_load. CONFIRMED MISS (pre-existing since at
+  least v16): stress_ord o2 (== -> !=, dialect.py:254) and o3 (and -> or, :253): full-suite truth 28 / 31 failing,
+  v16/v17/v20 select 82 and miss 25. o1/o4 (guards) were already ALL-ish: 0 missed. o4 truth needed a 120 s
+  per-test timeout (the inverted guard hangs tests; 900 s ran 3 h).
+- stress_real holdout (36 upstream reverts): v20 0 missed, v21 0 missed (698.8 s, 19.41 s/commit).
+
+### experiment/postreset-v21 (base f8f2070 = v20): post-reset coverage pass — commit 2499cde
+
+- mapgen/reset_plugin.py (RESET_PASS=1 mapgen/run_coverage.sh -> ../mapout_reset): static scan of collected test
+  classes for setUp/tearDown/setUpClass/tearDownClass that mutate sqlglot state (found: TestDialectEntryPoints
+  setUp+tearDown, TestLineage.setUpClass, TestOptimizer.setUpClass); each runs before every other test.
+  mapgen/union_map.py unions lines/touch/users/refs reader sets into the normal map (201 entries grew). `opens` not
+  merged: tests failing in that pass read dialect.py for tracebacks, which made sample 2haz +2 s in a first attempt.
+- Gate vs f8f2070 (--allow-cost-increase, all corpora incl. stress_ord, stress_real sealed): PASS. 0/30 sample,
+  0/401 mutants, unit tests OK (new ordreg), fill 0.0 s; sample 101.4 unchanged; mutants +100.9 s (o2/o3 now ~1,232).
+- Docker (no-cache amd64, git archive 2499cde): kit sample 101.368 s, 0 misses; image with kit RUN_FLAGS on
+  ../stress_ord and ../stress_hvv byte-identical to local.
