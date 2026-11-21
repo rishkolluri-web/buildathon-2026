@@ -84,6 +84,9 @@ def main():
     ap.add_argument("--python", default=str(REPO.parent / ".venv313" / "bin" / "python"))
     ap.add_argument("--base", default="HEAD", help="git revision to beat")
     ap.add_argument("--json", help="write the measured numbers here")
+    ap.add_argument("--allow-cost-increase", action="store_true",
+                    help="correctness fixes: report cost but do not require it to drop "
+                         "(all safety checks still apply)")
     a = ap.parse_args()
 
     kit, stress = Path(a.kit).resolve(), Path(a.stress).resolve()
@@ -123,7 +126,8 @@ def main():
         ("sample misses = 0", not s_miss, f"{len(s_miss)} {s_miss}" if s_miss else "0/30"),
         ("mutation misses = 0", not m_miss, f"{len(m_miss)} {m_miss}" if m_miss else f"0/{len(truth)} with ground truth"),
         ("unit tests pass", ut_ok, ut_line),
-        ("cost strictly lower than " + a.base, (c_s + c_m) < (b_s + b_m),
+        ("cost strictly lower than " + a.base + (" (informational)" if a.allow_cost_increase else ""),
+         a.allow_cost_increase or (c_s + c_m) < (b_s + b_m),
          f"sample {b_s:.1f}->{c_s:.1f}  mutants {b_m:.1f}->{c_m:.1f}  total {b_s + b_m:.1f}->{c_s + c_m:.1f} ({c_s + c_m - b_s - b_m:+.1f}s)"),
         ("fill adds 0.0 s to max worker", not fill_bad, f"{len(fill_bad)} commits differ" if fill_bad else "0.0 s on all"),
         ("narrowed patches have ground truth", not unverified,
