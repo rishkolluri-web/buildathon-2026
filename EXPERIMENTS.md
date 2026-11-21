@@ -216,3 +216,15 @@ Diagnosis: 3 official submissions at exactly 174.5 s while the sample improved. 
 - Docker (no-cache amd64, `git archive 91c5abd`, kit make sample): 101.368 s, 0 misses.
   - Image on the 43 trimmable patches (as nobody, read-only, no network): byte-identical to local output, all 43 trimmed.
 - Expected official effect: only on hidden ALL commits that edit non-core modules (dialect, parser, generator or optimizer files). Core-module ALL commits are unchanged.
+
+### experiment/heavy-lines-v15 (base 91c5abd = v14): import-time lines → tests executing them in isolation — code 4a0f29d
+
+- Why: almost all core-module ALL fallbacks are "import-time lines". parser.py has 3132 of them, tokenizer_core 829, expressions/core 1149. They come mostly from SQL templates parsed in class bodies (generators/duckdb.py lines 95–102 and 2052–2388, typing/hive.py 97–98), found by tracing the innermost module or class-body frame.
+- `mapgen/iso_imp.py` → iso_imp.json.gz (87 KB). Every numbered test runs alone, with coverage in every process (pool children included). For each import-time line it records the tests whose own run executes it. Build took 247 s with 7 jobs; 1 unknown test (test_dialect::test_lazy_load, fails in isolation), which is always selected.
+- `heavy.json` now also holds the slow tests' executed lines; this is the fallback when iso_imp is absent. In the earlier truth runs, every non-syntax heavy-test failure (42) hit lines that test executes.
+- Rule: an import-time function-body line selects coverage ∪ the tests whose isolated run executes it ∪ unknown tests, instead of ALL.
+- New corpus ../stress_iso: 30 core import-time mutants (itb/ops in dialect, expressions/core, errors, generator, helper, jsonpath, parser, tokenizer_core). Full-suite truth: 0 misses, with up to 1255 failing tests per mutant.
+- Gate vs 91c5abd (all 20 corpora): PASS. 0/30 sample, 0/328 truth mutants. Total 5383.7 → 5160.1 s (−223.6 s). Fill 0.0 s. Unit tests OK.
+- The gain per core ALL is modest: 36.8 → about 27.5 s when test_max_nodes doesn't execute the line. Most tests execute core tokenizer and parser lines anyway.
+- CPU on the sample (bench, 5 runs): 0.430 s (v14) vs 0.430 s.
+- Docker (no-cache amd64, `git archive 4a0f29d`, kit make sample): 101.368 s, 0 misses. Image output on ../stress_iso (as nobody, read-only, no network) is byte-identical to local.
