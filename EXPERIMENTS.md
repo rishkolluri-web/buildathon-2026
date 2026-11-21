@@ -321,3 +321,33 @@ Diagnosis: 3 official submissions at exactly 174.5 s while the sample improved. 
   UPPER attribute names. Unit tests 66 OK. Gate vs ecf5f82 (all corpora): PASS, 0/30, 0/335, +0.0 s, fill 0.0 s.
 - CPU (image-like app dirs, own index, PYTHONDONTWRITEBYTECODE=1, 9 interleaved runs): v17 `python selector.py`
   0.2275 s median -> v18 pyc import entry 0.1902 s (-0.037 s, -16 %).
+
+### experiment/heavyval-v20 (base c322c76 = v19): slow tests dropped by their solo value trace — commit f8f2070
+
+- Why: after v19, attribution of slow-test selections on sample + 21 corpora (v19, fill off): test_max_nodes
+  selected in 51 commits / fails in 5; test_execute_tpcds 124 / 41; test_generator_memory 133 / 35. Largest FP
+  source for all three: v15's import-time isolated-run rule (29 / 41 / 48 FPs). The existing value rules fall
+  through there because the edited line also runs at import (`<import>` collapses to "all tests").
+  Speculative in-container execution was modelled first and rejected (CPU 1:1; realistic +1 s, best case +7 s on
+  the sample; sample's 12 zero-failure commits already select ~nothing).
+- Data: mapgen/run_heavy_vt.sh -> heavy_vt.json (85 KB): each test > 3 s run ALONE under vtrace + eq_trace,
+  PYTHONHASHSEED 0/1/2 (15 runs, all passed). In a solo run every observation (imports, collection, pool work —
+  inline for vtrace, spawned children for eq_trace) belongs to that test.
+- Rule (selector.py heavy_value_drop, BR_OFF=heavyval): one sqlglot module edited in place, balanced hunks, and the
+  ONLY tree differences are comparison operators / single comparison constants / is-== swaps (existing detectors).
+  Drop slow test H when at every edited site every evaluation in H's solo trace gives the same result: relational
+  op -> solo cmp alternatives (site must be in the full trace's `seen`); constant or ==/!= op on a constant site ->
+  solo observed values (site must be in the full trace's `cv`; "U" keeps); is/== -> solo eq record must exist and be
+  interchangeable. Never on no_trim, multi-file, tests opening the file, or analysis errors.
+- Candidate corpus: scripts/heavyval_mutations.py, 3,856 comparison edits over sqlglot/*.py; v19 selects a slow
+  test in 718; v20 changes 62 (only slow tests removed). All 62 -> ../stress_hvv, full-suite truth: 0 misses;
+  8 of them break a slow test and the rule kept it in every case. Existing corpora: only stress_cv cu01 changes
+  (drops test_max_nodes; truth: passes). Negative controls (5 known test_max_nodes failures) all still selected.
+- Gate vs c322c76 (48 corpus args incl. stress_hvv; stress_real sealed): PASS. 0/30 sample, 0/397 mutants, unit
+  tests 71 OK (new: hvdrop/hvkeep), fill 0.0 s, all narrowed verified; mutants 7095.4 -> 6298.6 s (-796.8 s), sample
+  101.4 unchanged.
+- Expected hidden effect: small. Uniform 1,500-site census (seed 20261121): 4 sites change, -0.041 s/site
+  (8.69 -> 8.65); comparison-only candidates -0.20 s/site. Roughly 1-2 s per hidden batch. CPU not benchmarked
+  (extra parse only when a slow test is selected).
+- Docker (no-cache amd64, git archive f8f2070, kit make -o build sample): 101.368 s, 0 misses; image run with the
+  kit RUN_FLAGS on ../stress_hvv byte-identical to local (62 drops logged in-image).
