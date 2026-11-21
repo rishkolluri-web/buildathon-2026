@@ -289,8 +289,14 @@ class Differ:
             # header changed
             if isinstance(o, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 self.regions.append(("lines", span(o)))
-                if ctx[0] == "class" and ("classhdr" not in OFF or o.name != n.name):
-                    # decorators/defaults/name are evaluated at class creation
+                decorators_changed = [ast.dump(d) for d in o.decorator_list] != [ast.dump(d) for d in n.decorator_list]
+                if ctx[0] == "class" and ("classhdr" not in OFF or o.name != n.name) and (
+                    o.name != n.name or decorators_changed or "argshdr" in OFF
+                ):
+                    # a rename or decorator change alters the class itself (decorators run
+                    # at class creation and may register the method). An args/defaults-only
+                    # change matters only when the method is called, and every test that
+                    # called it under the old code executed its body: span coverage above.
                     self.regions.append(("class", ctx[1]))
                 elif ctx[0] == "module" and o.name != n.name:
                     self.regions.append(("module", [o], [n]))
