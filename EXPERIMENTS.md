@@ -74,3 +74,14 @@ test_execute_tpcds (21.454 s) review: selected through coverage of the changed l
 - 55 stress mutants without truth: none selects fewer tests than c003640.
 - Gate vs c003640 (stress + stress_h3 + stress_x): PASS, 0/30 sample, 0/29 mutants missed, total 1094.4 -> 1036.9 s (-57.5 s), fill 0.0 s. Unit tests 42 OK (1 skipped: protocol run needs RWX_DATA/RWX_OUTPUT).
 - Follow-up targeted corpus ../stress_u (u1 new dialect, u2 new optimizer module, u3 registration across two files, u4 two class-data edits in two files, u5 base flag, u6 dialect name list, u7 lazy optimizer attribute table): full-suite truth running; then m050/m066/m068 truth (`--only`). Not yet in the gate: u4/u5 are narrower than c003640.
+- Follow-up truth (../stress_u, new harness: sqlglotc copied, baseline 1621 passed, 0 errors). Failing = new failures vs baseline; no collection errors, all ids mapped:
+
+  | Mutant | Failing | c003640 | b702e01 | 107a4c3 |
+  |---|---|---|---|---|
+  | u1 new dialect file | 1 (#193 test_get_or_raise) | **MISS** (0 sel) | **MISS** (1 sel) | caught (all) |
+  | u2 new optimizer module | 0 | 0 sel | 1 sel | all |
+  | u3 registration across two files | 4 | all | all | all |
+  | u4 two class-data edits, two files | 4 (= t3 ∪ x_t11_035 failures) | 1548, 0 missed | 63, 0 missed | 63, 0 missed |
+  | u5 base flag SUPPORTS_UESCAPE | 2 | 1381, 0 missed | 26, 0 missed | 26, 0 missed |
+
+  u6/u7 and m050/m066/m068 truth still running. Docker on exact 107a4c3 (no-cache amd64, kit make sample): 170.356 s, 0 misses; protocol check on its output OK.
