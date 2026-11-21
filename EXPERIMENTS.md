@@ -181,3 +181,17 @@ Equivalence evidence: scripts/diff_swap.py over EVERY single-op is/==/is not/!= 
 Unit test: build-time index == lazy == corrupt-index output on every edge-case patch.
 gate.py fix: the base revision now also gets its eqsites.json (before, gating against v8 ran v8 without
 its swap rule and overstated the base cost).
+
+### Track A (value-trace rules, ddd9678c2a16fb0a5013829b2803eac40bbacf05)
+
+- First trace attempt FAILED the gate: c2/c3 (MySQL/Hive TIME_MAPPING) missed test_presto::test_time; lazy
+  dialect imports ran metaclass bulk reads inside one test. Fix: reads during any module import = "<import>".
+- New corpora: ../stress_d (44: 24 dict-value, 20 comparison-operator; adversarial, largest narrowings first),
+  ../stress_f (10 closure-factory argument changes), + truth for m023. All 0 missed.
+- Gate vs 5bf7a1e, sample + 12 corpora: PASS — 0/30 sample, 0/144 truth mutants, units 55 OK, fill 0.0 s,
+  all narrowed patches verified; total 2211.9 -> 1648.2 s (-563.7 s).
+- Sample: 120.108 -> 101.552 s (2qn5 2.54 -> 0, 4d63 12.69 -> 0, gbav 3.33 -> 0; all 0 failing).
+  Existing corpora narrowed: t5 5.55 -> 2.03, w6 2.11 -> 0, m023 3.41 -> 0 (all verified).
+- Docker (no-cache amd64 build of `git archive ddd9678`, make sample): 101.552 s, 0 misses; static index built in image.
+- CPU (loaded machine, 5 runs, same conditions): sample 8238fd6 0.957 / 5bf7a1e 1.214 / ddd9678 0.428 s;
+  141 mutants 11.9 / 30.5 / 6.3 s. RSS sample 113.6 -> 92.5 MiB.
