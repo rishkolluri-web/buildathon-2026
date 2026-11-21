@@ -111,3 +111,13 @@ c003640 known gap: a new sqlglot/dialects/<name>.py (u1) breaks test_get_or_rais
 - Fix: family_users(path) follows cross-dialect references derived from the pinned source (any line importing another family's module or naming its dialect key in a string literal; registry files dialect.py / dialects/__init__.py skipped). Runtime reference line -> tests executing it; import-time reference -> every user of the referencing family, transitively; non-family import-time line -> tests touching that file. 0.08 s CPU, lazy.
 - Never narrower than b2c241e on 132 patches; changed: c1 87 -> 88 (adds test_to_char, cost 10.58 s unchanged), c2 MySQL mapping 12.69 -> 27.45 s, c3 Hive mapping 13.16 -> 27.45 s, m001/m036 +1 test (no cost). Sample 170.3 s unchanged.
 - Audit set v truth (../stress_v): b2c241e and fix 0 missed on all 8 (v1 1 failing, v2 1, v3 0, v4 0, v5 1, v6 1, v7 1 [c003640 misses], v8 0). Gate vs c003640 (stress, h3, x, u, v): PASS 0/30, 0/47, -115.9 s, fill 0.0 s. Unit tests 44 OK (1 skipped). Cross-dialect corpus ../stress_c (c1 teradata, c2 mysql, c3 hive mapping) truth running.
+
+### Official BB-977554CD (aa103eb, experiment/crossdialect-v6): 196.7 s, 0 misses
+
+| Submission | SHA | Score | Simulated | CPU | Missed |
+|---|---|---|---|---|---|
+| BB-977554CD | aa103ebfcbbfd2c407640ddbb37bc90f5a3265ce | 196.7 s | 195.335 s | 1.34 s | 0 |
+| (best) BB-7C706349 | c00364018665e0abfad31a10173d9044892e7c69 | 190.8 s | 189.804 s | ~1.0 s | 0 |
+| BB-709BA77F | 107a4c369c20be07204f3ab85719d92807f57640 | 222.0 s | 220.777 s | ~1.2 s | 0 |
+
+c1 (Teradata "DD") full-suite truth: 2 new failures; c003640 and b2c241e miss test_presto::test_to_char (#624), aa103eb selects both.
