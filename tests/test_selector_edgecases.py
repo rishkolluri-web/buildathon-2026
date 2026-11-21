@@ -77,6 +77,13 @@ class EdgeCases(unittest.TestCase):
             "hdk": udiff("sqlglot/parsers/spark2.py", read("sqlglot/parsers/spark2.py"),
                          read("sqlglot/parsers/spark2.py").replace("seq_get(args, 0), to=exp.DataType", "seq_get(args, 1), to=exp.DataType", 1)
                          .replace("from sqlglot.parsers.hive import HiveParser\n", "from sqlglot.parsers.hive import HiveParser\n\n\nclass Dialect_:\n    pass\n", 1)),
+            # heavy value rule (heavy_vt.json): constant change at a tokenizer comparison test_max_nodes's solo run
+            # never decides differently (stress_cv cu01, full-suite truth: it passes) vs a parser constant
+            # change it does observe (stress_cv ci02, full-suite truth: test_max_nodes fails)
+            "hvdrop": udiff("sqlglot/tokenizer_core.py", read("sqlglot/tokenizer_core.py"),
+                            read("sqlglot/tokenizer_core.py").replace('if char == "\\n" or char == "\\r":', "if char == 'Y' or char == \"\\r\":", 1)),
+            "hvkeep": udiff("sqlglot/parser.py", read("sqlglot/parser.py"),
+                            read("sqlglot/parser.py").replace("        n = len(parts)\n\n        if n == 1:\n", "        n = len(parts)\n\n        if n == 0:\n", 1)),
             "cmnt": udiff("sqlglot/helper.py", helper, helper.replace("\ndef ", "\n# just a note\ndef ", 1)),
             "newf": udiff("sqlglot/brand_new.py", None, "X = 1\n"),
             "ndia": udiff("sqlglot/dialects/myqsl.py", None,
@@ -251,6 +258,12 @@ class EdgeCases(unittest.TestCase):
         # a test with no isolated run (fails alone) is always selected
         self.assertIn(self.num("tests/dialects/test_dialect.py::TestDialect::test_lazy_load"), sel)
         self.assertLess(len(sel), len(self.tests))
+
+    def test_heavy_value_rule_drops_only_unaffected_slow_tests(self):
+        mx = self.num("tests/test_parser.py::TestParser::test_max_nodes")
+        self.assertNotIn(mx, self.sel["hvdrop"])
+        self.assertTrue(self.sel["hvdrop"])  # other tests observing the site stay selected
+        self.assertIn(mx, self.sel["hvkeep"])  # negative control: its solo run sees n == 1
 
     def test_trimmed_all_fails_closed_on_import_side_effects(self):
         # import-time store into another module's object / a class that could replace a registered

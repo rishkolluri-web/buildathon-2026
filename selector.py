@@ -42,6 +42,8 @@ VMAP = Path(os.environ.get("BR_VMAP", HERE / "vmap.json.gz"))
 HEAVY = Path(os.environ.get("BR_HEAVY", HERE / "heavy.json"))
 # Import-time lines executed by each test's own isolated run (mapgen/iso_imp.py).
 ISO = Path(os.environ.get("BR_ISO", HERE / "iso_imp.json.gz"))
+# Solo value/identity traces of each test > 3 s, imports included (mapgen/heavy_vt.py).
+HVT = Path(os.environ.get("BR_HVT", HERE / "heavy_vt.json"))
 
 WORKER_MS = 2000
 MAX_WORKERS = 8
@@ -2166,6 +2168,140 @@ class Selector:
         return out
 
     def select(self, patch_text):
+        chosen = self._select(patch_text)
+        if chosen is not ALL and not isinstance(chosen, (set, TrimmedAll)):
+            return chosen
+        if isinstance(chosen, set) and not any(n in chosen for n in self.slow_numbers()):
+            return chosen  # no slow test selected: nothing to drop (skips the extra parse)
+        try:
+            drop = self.heavy_value_drop(patch_text)
+        except Exception as e:  # noqa: BLE001 - the rule only ever removes tests: on any doubt keep them
+            log(f"  heavy value rule error {e!r} -> unchanged")
+            drop = set()
+        if not drop:
+            return chosen
+        log(f"  slow test(s) {sorted(drop)}: every evaluation of the edited site(s) in their solo trace gives "
+            f"the same result -> dropped")
+        if chosen is ALL:
+            return TrimmedAll(set(drop))
+        if isinstance(chosen, TrimmedAll):
+            return TrimmedAll(set(chosen.exclude) | drop)
+        return chosen - drop
+
+    def slow_numbers(self):
+        """Numbers of tests > 3 s (the only tests heavy_vt.json can trace), from tests.json durations."""
+        s = self.__dict__.get("_slow")
+        if s is None:
+            s = self._slow = {t["number"] for t in json.loads((DATA / "tests.json").read_text())["tests"]
+                              if t["seconds"] > 3}
+        return s
+
+    def heavy_vt(self):
+        """{test number: solo trace record} (mapgen/heavy_vt.py); {} if unavailable."""
+        hv = self.__dict__.get("_hvt")
+        if hv is None:
+            hv = {}
+            if "heavyval" not in OFF:
+                try:
+                    raw = json.loads(HVT.read_text())["tests"]
+                    hv = {self.m.num_by_id[t]: r for t, r in raw.items() if t in self.m.num_by_id}
+                except Exception as e:  # noqa: BLE001 - no data: the rule does not apply
+                    log(f"heavy value trace unavailable ({e!r})")
+            self._hvt = hv
+        return hv
+
+    def heavy_value_drop(self, patch_text):
+        """Slow tests (> 3 s, solo-traced) that a single-file, value-only comparison edit cannot affect.
+
+        Applies only when the patch edits one sqlglot module in place and the ONLY differences between
+        the trees are comparison operators, single comparison constants, or is/== swaps (the detectors
+        of the existing value rules). A slow test is dropped when, at every edited site, every evaluation
+        recorded in its solo trace (imports, collection and pool work included, several hash seeds)
+        gives the same result before and after: then its isolated run executes exactly as before.
+        Unknown values, untraced kinds and sites not proven instrumented keep the test."""
+        if "heavyval" in OFF or self.no_trim:
+            return set()
+        hv = self.heavy_vt()
+        if not hv:
+            return set()
+        files = parse_patch(patch_text)
+        if len(files) != 1:
+            return set()
+        f = files[0]
+        path = f["new"]
+        if (f["binary"] or not f["hunks"] or f["old"] != path or not path
+                or not path.startswith("sqlglot/") or not path.endswith(".py")):
+            return set()
+        hunks = [(s, list(b)) for s, b in f["hunks"]]
+        if not balanced_hunks(hunks):
+            return set()
+        old_text = (SRC / path).read_text(encoding="utf-8")
+        new_lines, ot, nt = apply_hunks(old_text.split("\n"), [(s, list(b)) for s, b in hunks])
+        old_tree, new_tree = ast.parse(old_text), ast.parse("\n".join(new_lines))
+        touched = ot | nt
+        v = self.vmap()
+        if not v or "cv" not in v:
+            return set()
+        compares = {f"{n.lineno}:{n.col_offset}": n for n in ast.walk(old_tree) if isinstance(n, ast.Compare)}
+        checks = []  # (kind, key, detail)
+        sw = swap_only_sites(old_tree, new_tree, touched) if swap_only_hunks(hunks) else None
+        if sw:
+            checks = [("eq", f"{path}:{s}", None) for s in sw]
+        else:
+            ops = op_change_sites(old_tree, new_tree, touched) if op_only_hunks(hunks) else None
+            if ops:
+                for s, a, b in ops:
+                    checks.append(("eq", f"{path}:{s}", None) if {a, b} in _SWAPS
+                                  else ("op", f"{path}:{s}", (a, b, compares.get(s))))
+            else:
+                cc = const_change_sites(old_tree, new_tree, touched)
+                if not cc:
+                    return set()
+                checks = [("const", f"{path}:{s}", (op, cside, c0, c1)) for s, op, cside, c0, c1 in cc]
+        keep_open = self.opened_by(path)
+        drop = set()
+        for num, rec in hv.items():
+            if num in keep_open:
+                continue
+            if all(not self.heavy_site_affects(rec, v, *c) for c in checks):
+                drop.add(num)
+        return drop
+
+    @staticmethod
+    def heavy_site_affects(rec, v, kind, key, detail):
+        """Can this edited site change any evaluation in the solo-traced test `rec`? (True when unsure)"""
+        if kind == "eq":
+            return rec["eq"].get(key) is not True  # absent = unknown (the eq trace has no instrumented-site list)
+        if kind == "const":
+            op, cside, c0, c1 = detail
+            if key not in v["cv"]:
+                return True  # not proven instrumented
+            vals = rec["cv"].get(key)
+            if vals is None:
+                return False  # instrumented, never executed by this test
+            if vals == "U":
+                return True
+            return any(cmp_result(op, val, c0, cside) != cmp_result(op, val, c1, cside) for _, val in vals)
+        a, b, node = detail  # operator change
+        if a in _REL_OPS and b in _CMP_OPS and key in v["seen"]:
+            if key not in rec["seen"]:
+                return False
+            return _CMP_OPS[b] in rec["cmp"].get(key, ())
+        if a in _CV_OPS and b in _CV_OPS and key in v["cv"] and node is not None:
+            sides = [node.left, node.comparators[0]]
+            ci = [i for i, x in enumerate(sides) if isinstance(x, ast.Constant) and type(x.value) in (int, str)]
+            if len(ci) != 1:
+                return True
+            const = sides[ci[0]].value
+            vals = rec["cv"].get(key)
+            if vals is None:
+                return False
+            if vals == "U":
+                return True
+            return any(cmp_result(a, val, const, ci[0]) != cmp_result(b, val, const, ci[0]) for _, val in vals)
+        return True
+
+    def _select(self, patch_text):
         self.related = set()
         files = parse_patch(patch_text)
         if not files:
