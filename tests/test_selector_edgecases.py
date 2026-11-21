@@ -109,11 +109,21 @@ class EdgeCases(unittest.TestCase):
         (data / "tests.json").write_text((Path(KIT) / "sample" / "tests.json").read_text())
         for k, v in cls.patches.items():
             (data / "commits" / f"{k}.patch").write_text(v)
-        env = dict(os.environ, BR_DATA=str(data), BR_SRC=SRC, BR_MAP=str(REPO / "map.json.gz"))
+        env = dict(os.environ, BR_DATA=str(data), BR_SRC=SRC, BR_MAP=str(REPO / "map.json.gz"),
+                   BR_IDX=str(data / "none.pkl"))
         proc = subprocess.run([sys.executable, str(REPO / "selector.py")], env=env, capture_output=True)
         cls.stderr = proc.stderr.decode()
         assert proc.returncode == 0, cls.stderr
         cls.raw = proc.stdout
+        # same patches with the build-time static index (as in the image) and with a corrupt one
+        idx = data / "static_index.pkl"
+        subprocess.run([sys.executable, str(REPO / "selector.py"), "--build-index", str(idx)],
+                       env=env, capture_output=True, check=True)
+        cls.raw_idx = subprocess.run([sys.executable, str(REPO / "selector.py")], env=dict(env, BR_IDX=str(idx)),
+                                     capture_output=True, check=True).stdout
+        (data / "bad.pkl").write_bytes(b"not a pickle")
+        cls.raw_bad = subprocess.run([sys.executable, str(REPO / "selector.py")], env=dict(env, BR_IDX=str(data / "bad.pkl")),
+                                     capture_output=True, check=True).stdout
         cls.errors = check_output(proc.stdout, list_commit_ids(data / "commits"), load_test_numbers(data / "tests.json"))
         cls.tests = json.loads((data / "tests.json").read_text())["tests"]
         cls.sel = {}
@@ -256,6 +266,10 @@ class EdgeCases(unittest.TestCase):
     def test_sqlglotc_change_selects_its_tests(self):
         nums = {t["number"] for t in self.tests if t["file"] == "tests/test_sqlglotc.py"}
         self.assertTrue(nums and nums <= self.sel["sqgc"])
+
+    def test_static_index_changes_nothing(self):
+        self.assertEqual(self.raw_idx, self.raw)  # build-time index == lazy computation
+        self.assertEqual(self.raw_bad, self.raw)  # corrupt index -> ignored
 
     def test_garbage_and_empty_patches_do_not_crash(self):
         self.assertIn("junk", self.sel)

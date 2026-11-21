@@ -5,9 +5,13 @@ FROM python:3.13-slim@sha256:e48f59cdba69a3cbd9ed2cf0f348d90d45a8d350d98134cf107
 COPY docker/fetch_sqlglot.py /tmp/fetch_sqlglot.py
 RUN python /tmp/fetch_sqlglot.py /opt/sqlglot && rm /tmp/fetch_sqlglot.py
 
+ENV BR_SRC=/opt/sqlglot BR_MAP=/app/map.json.gz PYTHONDONTWRITEBYTECODE=1
+
 # Selector + coverage/fixture/class-usage map built from sqlglot's own test suite (see mapgen/).
 COPY selector.py map.json.gz eqsites.json /app/
-RUN chmod 755 /app && chmod 644 /app/selector.py /app/map.json.gz /app/eqsites.json
+# Static indexes over the pinned sources (cross-dialect references, import uses), computed
+# once here instead of on every run; the selector recomputes them if this file is absent.
+RUN python /app/selector.py --build-index /app/static_index.pkl \
+    && chmod 755 /app && chmod 644 /app/selector.py /app/map.json.gz /app/eqsites.json /app/static_index.pkl
 
-ENV BR_SRC=/opt/sqlglot BR_MAP=/app/map.json.gz PYTHONDONTWRITEBYTECODE=1
 CMD ["python", "/app/selector.py"]

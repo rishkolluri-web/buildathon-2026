@@ -30,6 +30,10 @@ DATA = Path(os.environ.get("BR_DATA", "/data"))
 SRC = Path(os.environ.get("BR_SRC", "/opt/sqlglot"))
 MAP = Path(os.environ.get("BR_MAP", HERE / "map.json.gz"))
 EQ = Path(os.environ.get("BR_EQ", HERE / "eqsites.json"))
+# Static indexes over the pinned sources (family_dependents, import_uses, derived/non-data
+# names), written at image build time by `selector.py --build-index` from the same BR_SRC.
+# Missing or unreadable -> computed lazily at runtime exactly as before.
+IDX = Path(os.environ.get("BR_IDX", HERE / "static_index.pkl"))
 
 WORKER_MS = 2000
 MAX_WORKERS = 8
@@ -495,6 +499,43 @@ class Selector:
             self.eq_safe = set(json.loads(EQ.read_text())["safe"]) if "eqswap" not in OFF else set()
         except (OSError, ValueError, KeyError):
             self.eq_safe = set()
+        if not OFF:  # ablation switches change import_uses/family results: never use the index then
+            self.load_static_index()
+
+    STATIC = ("_fam_deps", "_derived", "_non_data", "_imp_uses")
+
+    def load_static_index(self):
+        import pickle
+
+        try:
+            with open(IDX, "rb") as f:
+                idx = pickle.load(f)
+            if idx.get("src") != str(SRC) or set(idx) != set(self.STATIC) | {"src"}:
+                return
+        except Exception:  # absent/corrupt: lazy computation as before
+            return
+        for k in self.STATIC:
+            self.__dict__[k] = idx[k]
+
+    def build_static_index(self, out):
+        """Precompute every pinned-source index family_users() can consult."""
+        import pickle
+
+        deps = self.family_dependents()
+        self.derived_names()
+        for rel in sorted({rel for lst in deps.values() for rel, _, _ in lst}):
+            self.import_uses(rel)
+        keys = set(deps)
+        for d in self.FAMILY_DIRS:
+            keys |= {p.stem for p in (SRC / "sqlglot" / d).glob("*.py")}
+        for k in sorted(keys):
+            self.non_data_names(k)
+        idx = {k: self.__dict__[k] for k in self.STATIC}
+        idx["src"] = str(SRC)
+        with open(out, "wb") as f:
+            pickle.dump(idx, f, protocol=pickle.HIGHEST_PROTOCOL)
+        log(f"static index: {len(idx['_fam_deps'])} families, {len(idx['_imp_uses'])} files, "
+            f"{len(idx['_non_data'])} keys -> {out}")
 
     MODULE_STMTS = (ast.Assign, ast.AnnAssign, ast.AugAssign, ast.Import, ast.ImportFrom,
                     ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
@@ -1212,4 +1253,7 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    if sys.argv[1:2] == ["--build-index"]:  # image build only (docker/Dockerfile), never at scoring time
+        Selector.__new__(Selector).build_static_index(sys.argv[2])
+    else:
+        main()
