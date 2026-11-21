@@ -229,7 +229,7 @@ Diagnosis: 3 official submissions at exactly 174.5 s while the sample improved. 
 - CPU on the sample (bench, 5 runs): 0.430 s (v14) vs 0.430 s.
 - Docker (no-cache amd64, `git archive 4a0f29d`, kit make sample): 101.368 s, 0 misses. Image output on ../stress_iso (as nobody, read-only, no network) is byte-identical to local.
 
-### experiment/iso-mutsig-v16 (base 88ea19c = v15 4a0f29d + log): fail closed when an import-time edit changes mutation targets — uncommitted
+### experiment/iso-mutsig-v16 (base 88ea19c = v15 4a0f29d + log): fail closed when an import-time edit changes mutation targets — code f84987c
 
 - Parallel audit of v15 (cost / safety / runtime investigators):
   - Runtime: clean. All 6 data files in Dockerfile + gate/bench export lists; image-source subset (250 .py) gives
@@ -252,4 +252,4 @@ Diagnosis: 3 official submissions at exactly 174.5 s while the sample improved. 
   vs v15: 5226.5 -> 5235.1 s (+8.6): sa1 28.22 -> 36.82, itb-expressions-core-1379 1554 -> 1620 tests (cost unchanged;
   its subscript key edit counts as a target change). No other patch changes. vs v14 91c5abd: 5466.1 -> 5235.1 s (-231.0).
 - CPU (bench, sample, 5 runs x 2 interleaved; cloudd busy): v15 0.425/0.430 s, candidate 0.428/0.428 s; sim 101.368 s.
-- Not yet Docker-verified (needs a commit).
+- Docker (no-cache amd64, `git archive f84987c`, kit make -o build sample): 101.368 s, 0 misses. Image run with the kit RUN_FLAGS (uid 65534, read-only, no network) on ../stress_sa: byte-identical to local output.
