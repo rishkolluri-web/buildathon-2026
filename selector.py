@@ -29,6 +29,7 @@ HERE = Path(__file__).resolve().parent
 DATA = Path(os.environ.get("BR_DATA", "/data"))
 SRC = Path(os.environ.get("BR_SRC", "/opt/sqlglot"))
 MAP = Path(os.environ.get("BR_MAP", HERE / "map.json.gz"))
+EQ = Path(os.environ.get("BR_EQ", HERE / "eqsites.json"))
 
 WORKER_MS = 2000
 MAX_WORKERS = 8
@@ -425,9 +426,57 @@ def module_name(path):
     return p[: -len(".__init__")] if p.endswith(".__init__") else p
 
 
+_SWAPS = ({ast.Is, ast.Eq}, {ast.IsNot, ast.NotEq})
+
+
+class _NormOps(ast.NodeTransformer):
+    def visit_Compare(self, node):
+        self.generic_visit(node)
+        node.ops = [ast.Eq() if isinstance(o, ast.Is) else ast.NotEq() if isinstance(o, ast.IsNot) else o
+                    for o in node.ops]
+        return node
+
+
+_SWAP_NORM = re.compile(r"\bis\s+not\b|!=|\bis\b|==")
+
+
+def swap_only_hunks(hunks):
+    """Cheap prefilter: every removed line pairs with an added line that differs only by
+    is/== or is not/!= (the AST check below is the real test)."""
+    norm = lambda t: _SWAP_NORM.sub(lambda m: "!=" if m.group(0) in ("!=",) or m.group(0).startswith("is") and "not" in m.group(0) else "==", t)  # noqa: E731
+    for _, lines in hunks:
+        rem = [t for tag, t in lines if tag == "-"]
+        add = [t for tag, t in lines if tag == "+"]
+        if not rem or len(rem) != len(add) or any(norm(x) != norm(y) for x, y in zip(rem, add)):
+            return False
+    return True
+
+
+def swap_only_sites(old_tree, new_tree):
+    """["line:col", ...] of single-operator comparisons whose operator is swapped between
+    is/== or is not/!=, if that is the ONLY difference between the two trees; else None."""
+    import copy
+
+    a, b = _NormOps().visit(copy.deepcopy(old_tree)), _NormOps().visit(copy.deepcopy(new_tree))
+    if ast.dump(a) != ast.dump(b):
+        return None
+    sites = []
+    for x, y in zip(ast.walk(old_tree), ast.walk(new_tree)):
+        if isinstance(x, ast.Compare) and [type(o) for o in x.ops] != [type(o) for o in y.ops]:
+            if len(x.ops) != 1 or {type(x.ops[0]), type(y.ops[0])} not in _SWAPS:
+                return None
+            sites.append(f"{x.lineno}:{x.col_offset}")
+    return sites or None
+
+
 class Selector:
     def __init__(self, m: Map):
         self.m = m
+        self.sole = False
+        try:  # comparison sites where is/== are interchangeable on every traced execution
+            self.eq_safe = set(json.loads(EQ.read_text())["safe"]) if "eqswap" not in OFF else set()
+        except (OSError, ValueError, KeyError):
+            self.eq_safe = set()
 
     MODULE_STMTS = (ast.Assign, ast.AnnAssign, ast.AugAssign, ast.Import, ast.ImportFrom,
                     ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
@@ -666,6 +715,8 @@ class Selector:
         kind, chain = use
         if kind == "base":
             return "base"
+        if kind == "typecheck":
+            return "none"
         # X.NAME... reads exactly NAME from the class (what follows is read from NAME's value).
         # Provably unrelated only if NAME is a raw data constant: UPPER_CASE, never stored or
         # mutated by code (so it holds its class-body value), and not one of the changed names.
@@ -720,7 +771,7 @@ class Selector:
                         dotted[(m[1], m[2])] = m[2]
         if not local and not dotted:
             return out
-        parent, in_bases = {}, set()
+        parent, in_bases, typechecks = {}, set(), set()
         for n in ast.walk(tree):
             for c in ast.iter_child_nodes(n):
                 parent[id(c)] = n
@@ -728,6 +779,16 @@ class Selector:
                 for b in n.bases:
                     for x in ast.walk(b):
                         in_bases.add(id(x))
+            # isinstance(x, C) / issubclass(x, (C, D)): the class operand is only identity-
+            # checked against the MRO (no sqlglot metaclass defines __instancecheck__ /
+            # __subclasscheck__), so it reads none of C's attributes
+            if (isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and n.func.id in ("isinstance", "issubclass")
+                    and len(n.args) == 2 and not n.keywords):
+                cls_arg = n.args[1]
+                elts = cls_arg.elts if isinstance(cls_arg, ast.Tuple) else [cls_arg]
+                for e in elts:
+                    if isinstance(e, ast.Name):
+                        typechecks.add(id(e))
 
         def climb(node):
             chain, top = [], node
@@ -753,6 +814,8 @@ class Selector:
             chain = chain[skip:]
             if id(n) in in_bases:
                 kind = "base"
+            elif not chain and id(n) in typechecks and "typecheck" not in OFF:
+                kind = "typecheck"
             elif chain and isinstance(top.ctx, ast.Load):
                 kind = "attr"
             else:
@@ -898,6 +961,14 @@ class Selector:
             log(f"  {path}: syntax error after patch -> import breaks")
             return ALL if not path.startswith("tests/test_") and not path.startswith("tests/dialects/test_") else self.file_tests(path)
         old_tree = ast.parse(old_text)
+        if self.sole and not is_test_file and self.eq_safe and swap_only_hunks(hunks):
+            sites = swap_only_sites(old_tree, new_tree)
+            if sites and all(f"{path}:{site}" in self.eq_safe for site in sites):
+                # the patch only swaps is<->== / is not<->!= where every traced execution compared
+                # operands for which identity and equality agree by construction: every
+                # comparison returns what it did before, so the program runs unchanged
+                log(f"  {path}: identity/equality swap at interchangeable site(s) {sites} -> no tests")
+                return set()
         # def/class header lines (decorators, signature, defaults) execute at import to
         # *create* the function/class; their effect shows up only through callers and
         # class users, which the header-change rules already select. Only statements
@@ -1018,6 +1089,7 @@ class Selector:
                         return ALL
                 if not f["hunks"] and f["new"] and f["old"]:
                     continue  # mode-only change
+                self.sole = len(files) == 1
                 r = self.py_change(path, old_text, f["new"] is None, f["hunks"])
                 if r is ALL:
                     return ALL

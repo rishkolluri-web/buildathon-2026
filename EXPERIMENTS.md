@@ -130,3 +130,19 @@ One rule vs aa103eb: cross-dialect propagation is attribute-level. A reference t
 - Narrowing truth (../stress_w): w1 MySQL SAFE_TO_ELIMINATE_DOUBLE_NEGATION 1 failing, v7 selects 7 tests, 0 missed (aa103eb 652, c003640 1096). w2-w6 pending (truth runs stalled by iCloud eviction of ../.venv313; re-downloading).
 - Regression tests: Teradata->Presto test_to_char; MySQL mapping -> test_hive::test_time, Presto test_to_char/test_time, SingleStore, T-SQL; Hive mapping -> Presto/Spark/T-SQL. Unit tests OK.
 - CPU (loaded machine): sample c003640 0.214 / aa103eb 0.322 / v7 0.440 s.
+
+### experiment/typecheck-v8 (WIP from champion 8238fd6; NOT a candidate until truth for ../stress_e and ../stress_b is in)
+
+Two independent rules (ablation: BR_OFF=typecheck / BR_OFF=eqswap):
+- B (typecheck): a class imported from a dialect family and used only as isinstance/issubclass's class operand reads none of its attributes (no __instancecheck__/__subclasscheck__ in sqlglot). Fixes optimizer/pushdown_predicates.py's isinstance(dialect, (Athena, Presto)) pulling the 94 tests of line 42 (incl. test_execute_tpcds) into Athena/Presto setting changes. Not solved by attrdeps-v7 (it classified this as "other" -> use). Settings sweep: 8 more Athena settings narrowed, 25.45 -> 10.69 s each.
+- A (eqswap): mapgen/eq_trace.py rewrites every single-op is/is not/==/!= comparison in pinned sqlglot into a recorder (installed via sitecustomize, so subprocesses too) and runs the full pinned suite (1621 passed under tracing, i.e. no behaviour change). A site is "interchangeable" if EVERY execution compared None vs a plain/builtin type, two members of the same Enum, two bools, or two objects with object.__eq__/__ne__ (never ints/strs/custom __eq__ such as Expression or the _Dialect metaclass). 1626 sites observed, 578 interchangeable -> eqsites.json (20 KB, shipped in the image). A single-file patch whose ONLY AST difference is is<->== / is not<->!= at interchangeable sites runs exactly like the original (same suite, same pinned code up to that comparison, same result there) -> selects nothing. Anything else (other edits, more files, chained comparisons, unobserved or unsafe sites) -> normal selection.
+- Priority C (4d63, Snowflake NUMERIC_ESCAPES value): the import-time read (dialect.py:404) uses keys only, but tokens.py:606 passes the full dict to every Snowflake tokenization at runtime -> every Snowflake tokenizer user can observe it; no defensible narrowing. Kept; import-time fallback (m016) untouched.
+
+| Config | Sample | 9 mutation corpora |
+|---|---|---|
+| champion 8238fd6 | 170.35 | 1575.88 |
+| A only | 120.11 | 1354.98 |
+| B only | 170.35 | 1531.58 |
+| A+B | 120.11 | 1310.68 |
+
+Sample: 2haz 25.45 -> 0 s, 66ks 24.79 -> 0 s (both 0 failing in answers). Corpora ../stress_e (6 interchangeable swaps that must have 0 failing + 4 unsafe negative controls) and ../stress_b (3 Athena settings): full-suite truth running. Unit tests 49 OK.

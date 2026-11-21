@@ -32,7 +32,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--src", required=True)
     ap.add_argument("--out", required=True)
-    ap.add_argument("--set", default="t", choices=["t", "u", "v", "w"], help="t: first targeted set; u: follow-up set; v: scoped-class-data/new-dialect audit; w: attribute-level cross-dialect narrowing")
+    ap.add_argument("--set", default="t", choices=["t", "u", "v", "w", "e"], help="t: first targeted set; u: follow-up set; v: scoped-class-data/new-dialect audit; w: attribute-level cross-dialect narrowing; e: identity/equality swaps")
     a = ap.parse_args()
     src, out = Path(a.src), Path(a.out)
     (out / "commits").mkdir(parents=True, exist_ok=True)
@@ -119,6 +119,40 @@ def main():
             "w4-mysqlgen-null-ordering": [edit("sqlglot/generators/mysql.py", "    NULL_ORDERING_SUPPORTED: bool | None = None\n", "    NULL_ORDERING_SUPPORTED: bool | None = True\n")],
             "w5-hivegen-properties-prefix": [edit("sqlglot/generators/hive.py", '    WITH_PROPERTIES_PREFIX = "TBLPROPERTIES"\n', '    WITH_PROPERTIES_PREFIX = "PROPERTIES"\n')],
             "w6-tsql-convert-format": [edit("sqlglot/dialects/tsql.py", '        "1": "%m/%d/%y",\n', '        "1": "%d/%m/%y",\n')],
+        }
+    elif a.set == "e":
+        import ast as _ast
+
+        swap = {"is": "==", "==": "is", "is not": "!=", "!=": "is not"}
+
+        def swap_at(path, line, col):
+            # swap the operator of the single-operator comparison starting at line:col
+            text = read(path)
+            lines = text.split("\n")
+            node = next(n for n in _ast.walk(_ast.parse(text)) if isinstance(n, _ast.Compare)
+                        and n.lineno == line and n.col_offset == col)
+            l, r = node.left, node.comparators[0]
+            assert l.end_lineno == r.lineno == line, (path, line)
+            seg = lines[line - 1][l.end_col_offset:r.col_offset]
+            op = seg.strip().strip("()").strip()
+            assert op in swap, (path, line, seg)
+            lines[line - 1] = (lines[line - 1][:l.end_col_offset] + seg.replace(op, swap[op], 1)
+                               + lines[line - 1][r.col_offset:])
+            return path, text, "\n".join(lines)
+
+        muts = {
+            # interchangeable sites (trace): every one must have 0 failing tests
+            "e1-safe-norm-is-none": [swap_at("sqlglot/dialects/dialect.py", 1170, 11)],
+            "e2-safe-tokentype-eq": [swap_at("sqlglot/tokenizer_core.py", 793, 30)],
+            "e3-safe-errorlevel-eq": [swap_at("sqlglot/parser.py", 2280, 11)],
+            "e4-safe-meta-is-none": [swap_at("sqlglot/expressions/core.py", 997, 11)],
+            "e5-safe-curr-tokentype-eq": [swap_at("sqlglot/parser.py", 2112, 11)],
+            "e6-safe-sentinel-ne": [swap_at("sqlglot/tokenizer_core.py", 532, 15)],
+            # negative controls (not interchangeable): the selector must keep their tests
+            "e7-unsafe-char-eq": [swap_at("sqlglot/tokenizer_core.py", 752, 11)],
+            "e8-unsafe-upper-text-eq": [swap_at("sqlglot/parser.py", 2149, 64)],
+            "e9-unsafe-index-ne": [swap_at("sqlglot/parser.py", 2101, 11)],
+            "e10-unsafe-expr-is-none": [swap_at("sqlglot/expressions/core.py", 1324, 15)],
         }
     else:
         muts = {k: [v] for k, v in muts.items()}

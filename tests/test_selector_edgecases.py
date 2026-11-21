@@ -63,6 +63,25 @@ class EdgeCases(unittest.TestCase):
             # cross-dialect: generators/presto.py reads Hive.INVERSE_TIME_MAPPING (derived at import)
             "hvtm": udiff("sqlglot/dialects/hive.py", read("sqlglot/dialects/hive.py"),
                           read("sqlglot/dialects/hive.py").replace('"d": "%-d",', '"d": "%d",', 1)),
+            # identity/equality swaps (eqsites.json: interchangeable on every traced execution)
+            "eqok": udiff("sqlglot/parser.py", read("sqlglot/parser.py"),
+                          read("sqlglot/parser.py").replace("        if self.error_level == ErrorLevel.WARN:\n",
+                                                            "        if self.error_level is ErrorLevel.WARN:\n", 1)),
+            "eqbad": udiff("sqlglot/parser.py", read("sqlglot/parser.py"),
+                           read("sqlglot/parser.py").replace("        if index != self._index:\n",
+                                                             "        if index is not self._index:\n", 1)),
+            "eqplus": udiff("sqlglot/parser.py", read("sqlglot/parser.py"),
+                            read("sqlglot/parser.py").replace("        if self.error_level == ErrorLevel.WARN:\n",
+                                                              "        if self.error_level is ErrorLevel.WARN:\n", 1)
+                            .replace("        if index != self._index:\n", "        if index != self._index + 0:\n", 1)),
+            "eqtwo": udiff("sqlglot/parser.py", read("sqlglot/parser.py"),
+                           read("sqlglot/parser.py").replace("        if self.error_level == ErrorLevel.WARN:\n",
+                                                             "        if self.error_level is ErrorLevel.WARN:\n", 1))
+                     + udiff("sqlglot/helper.py", helper, helper.replace("\ndef ", "\ndef _unused_zz():\n    return 1\n\n\ndef ", 1)),
+            # athena settings: pushdown_predicates only isinstance-checks Athena/Presto
+            "athk": udiff("sqlglot/parsers/athena.py", read("sqlglot/parsers/athena.py"),
+                          read("sqlglot/parsers/athena.py").replace("{*TrinoParser.DDL_SELECT_TOKENS, TokenType.USING}",
+                                                                    "{*TrinoParser.DDL_SELECT_TOKENS}", 1)),
             "nopt": udiff("sqlglot/optimizer/zz_rule.py", None, "def zz_rule(expression):\n    return expression\n"),
             "delf": udiff("sqlglot/dialects/tsql.py", tsql, None),
             "tfil": udiff("tests/test_transpile.py", transpile,
@@ -199,6 +218,25 @@ class EdgeCases(unittest.TestCase):
         self.assertIn("sqlglot/parsers/presto.py", {r[0] for r in refs["teradata"]})   # runtime lookup
         self.assertIn("presto", {r[2] for r in refs["mysql"]})                         # import-time copy
         self.assertIn("presto", {r[2] for r in refs["hive"]})                          # generator reads Hive
+
+    def test_identity_equality_swap_at_interchangeable_site_selects_nothing(self):
+        self.assertEqual(self.sel["eqok"], set())
+
+    def test_identity_equality_swap_elsewhere_keeps_tests(self):
+        # ints are not interchangeable (equal ints can be distinct objects)
+        self.assertGreater(len(self.sel["eqbad"]), 0)
+        # a safe swap plus any other edit, or a second changed file: normal selection
+        self.assertGreater(len(self.sel["eqplus"]), 0)
+        self.assertGreater(len(self.sel["eqtwo"]), 0)
+
+    def test_isinstance_only_import_is_not_a_data_dependency(self):
+        # optimizer/pushdown_predicates.py only does isinstance(dialect, (Athena, Presto)):
+        # an Athena setting must not pull in every test that runs pushdown_predicates
+        sys.path.insert(0, str(REPO))
+        import selector
+        sel = selector.Selector(selector.Map(selector.MAP, self.tests))
+        push = sel.m.nums(sel.lines_bits("sqlglot/optimizer/pushdown_predicates.py", [42]))
+        self.assertFalse(push <= self.sel["athk"])
 
     def test_nested_conftest_selects_everything(self):
         self.assertEqual(len(self.sel["cftn"]), len(self.tests))
