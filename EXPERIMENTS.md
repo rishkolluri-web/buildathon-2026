@@ -38,4 +38,5 @@ Baseline c003640 on 77 mutants: 785.7 s, 8 all-test escalations = 294.5 s (37 %)
 | Iter | Rule | Gate vs c003640 | Sample | Mutants | Δ | Patches changed (removed tests, truth) |
 |---|---|---|---|---|---|---|
 | 1 | H3: class-level data whose attributes are never read at import -> class/family users ∩ runtime readers of the attribute | PASS (19 truth) | 178.7→170.3 | 785.7→778.7 | −15.4 s | s:535z 11.24→2.85 (−221 tests; failing test_simplify kept); m:m034 9.03→2.04 (−24 tests; truth 0 failing) |
+| 2 | H2: import-time line -> users of the module-level statements that triggered it (traced import pass) | **FAIL: real miss** | 170.3 | 769.3 | −9.4 s | m016 (tokenizer_core.py:729, 1572 failing) misses test 1054; m051/m052 unverified. Import-time effects reach tests through shared state beyond trigger statements -> rejected, reverted; the all-tests fallback for import-time lines stays |
 
